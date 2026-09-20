@@ -8,7 +8,12 @@ import math
 import numpy as np
 import pytest
 
-from sea_mosaic.geo.projection import R_EARTH_M, geodetic_to_local_xy, project_gps_positions
+from sea_mosaic.geo.projection import (
+    R_EARTH_M,
+    estimate_pixels_per_meter,
+    geodetic_to_local_xy,
+    project_gps_positions,
+)
 
 
 # --- geodetic_to_local_xy ------------------------------------------------------------
@@ -110,3 +115,36 @@ def test_project_gps_positions_default_origin_is_smallest_key():
 
     assert projected[2] == pytest.approx([0.0, 0.0], abs=1e-9)
     assert projected[5] != pytest.approx([0.0, 0.0], abs=1e-6)
+
+
+# --- estimate_pixels_per_meter --------------------------------------------------------
+
+
+def test_estimate_pixels_per_meter_matches_real_data_smoke_camera_geometry():
+    """Real data/smoke/ geometry: RelativeAltitude~=99.978m (image 0352), DFOV=82.9deg
+    (DJI H20T official spec), 4056x3040 resolution. Expected value hand-computed via
+    diagonal FOV -> ground diagonal coverage -> pixels_per_meter = diagonal_px /
+    ground_diagonal_m (verified against the same formula run standalone: 28.70291923...)."""
+    pixels_per_meter = estimate_pixels_per_meter(
+        altitude_m=99.978, dfov_deg=82.9, width_px=4056, height_px=3040
+    )
+
+    assert pixels_per_meter == pytest.approx(28.70291923391581, rel=1e-9)
+
+
+def test_estimate_pixels_per_meter_higher_altitude_gives_fewer_pixels_per_meter():
+    """Flying higher covers more ground per image, so each meter maps to fewer pixels —
+    a basic sanity/monotonicity check independent of the exact camera constants above."""
+    low = estimate_pixels_per_meter(altitude_m=50.0, dfov_deg=82.9, width_px=4056, height_px=3040)
+    high = estimate_pixels_per_meter(altitude_m=100.0, dfov_deg=82.9, width_px=4056, height_px=3040)
+
+    assert high < low
+
+
+def test_estimate_pixels_per_meter_scales_linearly_with_resolution():
+    """Doubling both pixel dimensions (same sensor/FOV/altitude) must double
+    pixels_per_meter — the ground coverage is unchanged, only pixel density doubles."""
+    base = estimate_pixels_per_meter(altitude_m=99.978, dfov_deg=82.9, width_px=4056, height_px=3040)
+    doubled = estimate_pixels_per_meter(altitude_m=99.978, dfov_deg=82.9, width_px=8112, height_px=6080)
+
+    assert doubled == pytest.approx(2 * base, rel=1e-9)

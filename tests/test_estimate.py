@@ -10,8 +10,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from sea_mosaic.estimate import estimate_all_pairs, match_pair, sequential_pairs
+from sea_mosaic.estimate import (
+    default_inlier_count_reference,
+    estimate_all_pairs,
+    match_pair,
+    sequential_pairs,
+)
 from sea_mosaic.matcher import MatchResult
+from sea_mosaic.types import PairResult
 
 
 def test_sequential_pairs_contiguous_zero_based_keys() -> None:
@@ -160,3 +166,51 @@ def test_estimate_all_pairs_defaults_to_exhaustive_all_pairs() -> None:
     assert sorted((r.src_index, r.dst_index) for r in results) == [
         (0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3),
     ]
+
+
+def _pair_result_with_inlier_count(inlier_count: int, match_count: int) -> PairResult:
+    inlier_mask = np.zeros(match_count, dtype=bool)
+    inlier_mask[:inlier_count] = True
+    return PairResult(
+        src_index=0,
+        dst_index=1,
+        src_points=np.zeros((match_count, 2)),
+        dst_points=np.zeros((match_count, 2)),
+        inlier_mask=inlier_mask,
+        homography=np.eye(3),
+    )
+
+
+def test_default_inlier_count_reference_odd_count_is_the_middle_value() -> None:
+    pair_results = [
+        _pair_result_with_inlier_count(10, match_count=10),
+        _pair_result_with_inlier_count(30, match_count=30),
+        _pair_result_with_inlier_count(20, match_count=20),
+    ]
+
+    assert default_inlier_count_reference(pair_results) == 20.0
+
+
+def test_default_inlier_count_reference_even_count_averages_the_two_middle_values() -> None:
+    pair_results = [
+        _pair_result_with_inlier_count(10, match_count=10),
+        _pair_result_with_inlier_count(40, match_count=40),
+        _pair_result_with_inlier_count(20, match_count=20),
+        _pair_result_with_inlier_count(30, match_count=30),
+    ]
+
+    assert default_inlier_count_reference(pair_results) == 25.0
+
+
+def test_default_inlier_count_reference_matches_real_nine_edge_measurement() -> None:
+    """Real inlier_count values measured via match_pair(SiftBfRatioTestMatcher) across
+    all 9 sequential_pairs edges of data/smoke/'s 10 images (see CLAUDE.md 已知的限制):
+    median is 1861, not the mean (which the two low-inlier outlier edges pull down)."""
+    real_inlier_counts = [40, 40, 717, 1861, 1853, 2405, 2192, 2804, 3061]
+    pair_results = [_pair_result_with_inlier_count(count, count) for count in real_inlier_counts]
+
+    assert default_inlier_count_reference(pair_results) == 1861.0
+
+
+def test_default_inlier_count_reference_empty_pair_results_is_nan() -> None:
+    assert np.isnan(default_inlier_count_reference([]))

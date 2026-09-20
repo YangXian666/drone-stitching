@@ -74,6 +74,68 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     評估是否要導入 RoMa 等 dense matcher 的比較基準線。
   - 正式的 SIFT matcher（含 ratio test）與是否要導入 RoMa，留到
     feature-based pipeline 任務時再一起做，目前不動手實作。
+- **compose_global_transforms 的 GPS anchor 機制，實質上依賴某種粗略的
+  像素↔公尺換算才能發揮拉力，這個依賴之前沒有被意識到。已選定方向 A：
+  用針孔相機近似算一個粗略的 pixels_per_meter，跟完整的
+  `geo/camera.py`/`geo/direct.py` 精確 georeferencing 做清楚區隔——這是
+  兩件不同精度需求的事：compose.py 只需要「大概對得上量級」，direct
+  georeferencing 需要「準確的地理座標」。** 用真實資料實測過（不是合成
+  猜測值），過程與結論如下：
+  - **pixels_per_meter 換算方式（已定案）**：用 DFOV（對角線視角）+ 飛行
+    高度算地面對角線覆蓋長度，再依影像寬高比把對角線覆蓋拆成
+    ground_width_m / ground_height_m，`pixels_per_meter = 對角線像素數 /
+    對角線地面覆蓋公尺數`。用這批影像的真實數字：
+    `RelativeAltitude≈99.978m`、`DFOV=82.9°`（DJI H20T 官方規格）、
+    `4056×3040`，算出 `ground_diagonal≈176.6m`（`ground_width≈141.3m`、
+    `ground_height≈105.9m`），`pixels_per_meter≈28.703`
+    （`meters_per_pixel≈0.03484`）。
+  - **這是粗糙估計，近似來源要跟精確 georeferencing 明確區隔**：
+    (1) 針孔相機模型，沒有實際相機內參標定；(2) 用 `RelativeAltitude`
+    當高度基準，`AbsoluteAltitude` vs `RelativeAltitude` 的落差爭議見上面
+    「已知的暫緩事項」，還沒有釐清哪個基準更可靠；(3) 沒有做鏡頭畸變校正。
+  - **驗證結果**：套用 `pixels_per_meter≈28.703` 後，0352→0353 這對真實
+    邊的「原始（未加權）」edge/anchor 殘差比從 ≈170x（2.2 個數量級）降到
+    ≈5.9x（0.77 個數量級）——單位不一致的問題已解決，這個換算方式定案。
+  - **加權後的失衡（`information`/`weight` 公式本身的問題，不是單位問題）**：
+    加上 `information = inlier_count * eye(6)`（`inlier_count=40`）跟固定
+    `anchor weight=1.0` 之後，加權比例還有 ≈236.6x（2.37 個數量級）——
+    這是 `inlier_count` 沒有歸一化造成的，跟像素/公尺單位無關。
+  - **`inlier_count_reference` 定案：用這 9 條邊的 median（1861），不是任選
+    一條邊的實測值**。用真實資料對 `data/smoke/` 全部 10 張影像的
+    `sequential_pairs()` 9 條邊逐一跑過真實 `match_pair`（SIFT+ratio test），
+    inlier_count 落在 40～3061（mean=1663.7, median=1861），只有前兩條邊
+    （0→1、1→2）是 40，其餘 7 條邊都遠高於 40——用 40 當 reference 不具代表性
+    （它是最小值、離群值，不是「正常水準」）；用 mean 也不理想，會被這兩個
+    離群值往下拉。9 條邊完整診斷表格（`information = (inlier_count/1861) *
+    eye(6)`，`pixels_per_meter≈28.703`，anchor weight=1.0）：
+
+    | edge | inlier_count | tx_px | ty_px | gps_delta_m | raw_edge_residual_px | information (對角線係數) | weighted_edge_residual | raw_anchor_residual_px | weighted_ratio |
+    |------|-------------:|------:|------:|------------:|----------------------:|--------------------------:|------------------------:|------------------------:|---------------:|
+    | 0→1  | 40   | 2416.6 | -675.9 | 14.78 | 2509.3 | 0.0215 | 53.9    | 424.2 | 0.13 |
+    | 1→2  | 40   |  977.8 | -583.4 |  9.69 | 1138.6 | 0.0215 | 24.5    | 278.1 | 0.09 |
+    | 2→3  | 717  | 1697.2 | -682.1 | 14.40 | 1829.1 | 0.3853 | 704.8   | 413.3 | 1.71 |
+    | 3→4  | 1861 |  -82.6 |  364.2 | 13.28 |  373.4 | 1.0000 | 373.4   | 381.2 | 0.98 |
+    | 4→5  | 1853 |  -49.7 |  407.4 | 13.66 |  410.4 | 0.9957 | 408.6   | 392.1 | 1.04 |
+    | 5→6  | 2405 |  -75.2 |  333.7 | 13.01 |  342.1 | 1.2923 | 442.2   | 373.4 | 1.18 |
+    | 6→7  | 2192 |  -39.3 |  363.3 | 13.53 |  365.4 | 1.1779 | 430.4   | 388.4 | 1.11 |
+    | 7→8  | 2804 |  -13.8 |  443.2 | 13.99 |  443.4 | 1.5067 | 668.1   | 401.6 | 1.66 |
+    | 8→9  | 3061 |  -44.7 |  431.3 | 12.24 |  433.6 | 1.6448 | 713.2   | 351.3 | 2.03 |
+
+    加權比例橫跨全部 9 條邊落在 **0.09x～2.03x**（-1.06～0.31 個數量級），
+    對照組（reference=40）是 4.09x～94.45x（0.61～1.98 個數量級），
+    reference=mean(1663.7) 是 0.10x～2.27x（-1.01～0.36 個數量級，被
+    離群值拉低，範圍跟 median 接近但理論上不如 median 穩健）。
+  - **確認 information 數值本身符合設計意圖**：用 median=1861 當分母後，
+    inlier_count 最低的兩條邊（0→1、1→2）算出的 information 分別只有
+    0.0215（約是其他 7 條邊 0.385～1.645 的 1/18～1/76）——這是機制正確
+    運作的證據：這兩條邊的 pairwise homography 本來就最不可靠，理應在
+    最佳化目標裡被大幅降權，讓 GPS anchor 在這裡發揮相對更大的拉力，
+    不是需要修正的異常。
+  - **最終定案**：`information = (inlier_count / 1861) * eye(6)`
+    （`inlier_count_reference = 1861`，這批 `data/smoke/` 9 條邊實測
+    inlier_count 的 median），取代先前用單一邊 `inlier_count=40` 當
+    reference 的版本（40 是離群值、不具代表性，已被這次完整 9 邊驗證
+    推翻）。`pixels_per_meter≈28.703` 的換算方式維持不變。
 
 ## 目前狀態
 - [x] SSH + VS Code Remote-SSH + Claude Code CLI 環境

@@ -68,3 +68,19 @@ def estimate_all_pairs(
         match_pair(matcher, images[src_index], images[dst_index], src_index, dst_index, ransac_threshold)
         for src_index, dst_index in pairs
     ]
+
+
+def default_inlier_count_reference(pair_results: list[PairResult]) -> float:
+    """Median inlier_count across pair_results, for use as build_pose_graph's
+    inlier_count_reference when the caller has no better basis for one.
+
+    A pure function of this batch's pair_results only — it has no knowledge of
+    build_pose_graph or how its result will be used. Computing a reference this way
+    (rather than picking a fixed constant) is what makes inlier_count_reference adapt to
+    a new dataset's inlier_count distribution instead of silently reusing a value tuned
+    to a different one (see CLAUDE.md's 已知的限制 on why this must never default).
+
+    Returns np.nan for an empty pair_results (no data to compute a reference from — per
+    CLAUDE.md constraint 5, never fabricate a number here).
+    """
+    ...

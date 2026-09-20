@@ -54,3 +54,32 @@ def project_gps_positions(
         )
         for image_index, reading in gps_positions.items()
     }
+
+
+def estimate_pixels_per_meter(
+    altitude_m: float,
+    dfov_deg: float,
+    width_px: int,
+    height_px: int,
+) -> float:
+    """Rough pinhole-camera estimate of pixels-per-meter ground sampling density.
+
+    This is a crude approximation for compose_global_transforms's GPS anchors (which
+    need *some* pixel<->meter conversion to be dimensionally comparable to feature-match
+    residuals, even without absolute-scale precision) — it is NOT a substitute for
+    geo/camera.py / geo/direct.py's full camera model and precise georeferencing. Sources
+    of approximation: (1) an ideal pinhole camera with no real intrinsics/calibration,
+    (2) whatever altitude reading the caller passes in as ground truth (see CLAUDE.md's
+    documented AbsoluteAltitude vs RelativeAltitude ambiguity — this function takes no
+    position on which is correct), (3) no lens distortion correction.
+
+    Method: the diagonal field of view (dfov_deg) and altitude give the ground diagonal
+    coverage via a pinhole approximation (2 * altitude_m * tan(dfov_deg/2)); dividing the
+    image's diagonal pixel count by that ground diagonal gives pixels_per_meter directly
+    (splitting the diagonal into separate ground_width_m/ground_height_m via the pixel
+    aspect ratio, as one might do to sanity-check per-axis coverage, cancels out
+    algebraically and isn't needed for this ratio).
+    """
+    diagonal_px = np.hypot(width_px, height_px)
+    ground_diagonal_m = 2 * altitude_m * np.tan(np.radians(dfov_deg) / 2)
+    return float(diagonal_px / ground_diagonal_m)

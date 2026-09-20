@@ -58,11 +58,30 @@ class PoseGraph:
 def build_pose_graph(
     pair_results: list[PairResult],
     gps_positions: dict[int, np.ndarray] | None = None,
+    *,
+    pixels_per_meter: float,
+    inlier_count_reference: float,
 ) -> PoseGraph:
     """Build a pose graph from pairwise estimates and optional GPS anchors.
 
-    Edges come from pair_results' homographies (not chained); anchors come from
-    gps_positions when provided.
+    Edges come from pair_results' homographies (not chained; relative_pose is each
+    PairResult's homography as-is, since both already follow the src -> dst
+    convention). Each edge's information is
+    (pair_result.inlier_count / inlier_count_reference) * eye(6) — normalized so a
+    "typical" edge for this batch of pair_results carries a weight of about 1.0,
+    comparable to each GPS anchor's fixed weight of 1.0.
+
+    Anchors come from gps_positions when provided: gps_positions is expected in local
+    planar meters (geo.projection.project_gps_positions's output), and is converted to
+    pixel-equivalent units via pixels_per_meter before becoming each node's GPSAnchor
+    and initial_pose translation (a node with no GPS entry falls back to identity at the
+    origin as its initial pose guess).
+
+    pixels_per_meter and inlier_count_reference are both required, with no default:
+    both are numbers specific to the input dataset (camera/altitude geometry, and this
+    batch's inlier_count distribution respectively) — silently defaulting either one
+    would risk reproducing the exact unit/weight imbalance already measured and
+    documented in CLAUDE.md's 已知的限制 for data/smoke/.
     """
     ...
 
