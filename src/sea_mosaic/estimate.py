@@ -5,6 +5,9 @@ Uses an injected Matcher (see matcher.py) — never a hardcoded matcher implemen
 
 from __future__ import annotations
 
+import itertools
+
+import cv2
 import numpy as np
 
 from sea_mosaic.matcher import Matcher
@@ -34,7 +37,21 @@ def match_pair(
 ) -> PairResult:
     """Match one image pair with the given matcher and estimate a RANSAC homography,
     returning a PairResult."""
-    ...
+    match_result = matcher.match(image_a, image_b)
+    src_points = np.asarray(match_result.src_points, dtype=np.float64)
+    dst_points = np.asarray(match_result.dst_points, dtype=np.float64)
+
+    homography, mask = cv2.findHomography(src_points, dst_points, cv2.RANSAC, ransac_threshold)
+    inlier_mask = mask.reshape(-1).astype(bool)
+
+    return PairResult(
+        src_index=src_index,
+        dst_index=dst_index,
+        src_points=src_points,
+        dst_points=dst_points,
+        inlier_mask=inlier_mask,
+        homography=np.asarray(homography, dtype=np.float64),
+    )
 
 
 def estimate_all_pairs(
@@ -44,4 +61,10 @@ def estimate_all_pairs(
     ransac_threshold: float = 3.0,
 ) -> list[PairResult]:
     """Estimate PairResults for all (or the given) image pairs using the injected matcher."""
-    ...
+    if pairs is None:
+        pairs = list(itertools.combinations(sorted(images), 2))
+
+    return [
+        match_pair(matcher, images[src_index], images[dst_index], src_index, dst_index, ransac_threshold)
+        for src_index, dst_index in pairs
+    ]
