@@ -26,12 +26,12 @@ class PairResult:
     @property
     def match_count(self) -> int:
         """Total number of correspondences found for this pair, before RANSAC filtering."""
-        ...
+        return len(self.src_points)
 
     @property
     def inlier_count(self) -> int:
         """Number of correspondences that passed RANSAC geometric verification."""
-        ...
+        return int(np.count_nonzero(self.inlier_mask))
 
 
 @dataclass
