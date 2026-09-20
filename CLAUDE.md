@@ -50,7 +50,7 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
 - [x] SSH + VS Code Remote-SSH + Claude Code CLI 環境
 - [x] 專案骨架
 - [x] metrics.py + unit tests
-- [ ] EXIF/XMP 解析
-- [ ] direct georeferencing
+- [x] EXIF/XMP 解析 (GPS 座標讀取 + 局部平面投影，21/21 tests passing)
+- [ ] direct georeferencing (geo/camera.py, geo/direct.py) 仍暫緩，見「已知的暫緩事項」
 - [ ] feature-based pipeline
 - [ ] FastAPI
