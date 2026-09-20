@@ -148,8 +148,8 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     (SIFT + RANSAC, 43/43 tests passing)
   - [x] posegraph.py: optimize_pose_graph (Sim(2) 最小二乘 + GPS anchor，
     45/45 tests passing，另用不對稱合成資料驗證過 node index 對應正確)
-  - [ ] posegraph.py: build_pose_graph (從真實 PairResult + GPS 座標建圖)
-  - [ ] compose.py: compose_global_transforms
+  - [x] posegraph.py: build_pose_graph (從真實 PairResult + GPS 座標建圖)
+  - [x] compose.py: compose_global_transforms
   - [ ] warp.py
   - [ ] blend.py
   - [ ] pipeline.py: 串接 estimate → compose → warp → blend
