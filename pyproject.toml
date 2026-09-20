@@ -9,6 +9,7 @@ packages = [{ include = "sea_mosaic", from = "src" }]
 python = "^3.12"
 numpy = "^2.5.3"
 pandas = "^3.0.6"
+pillow = "^12.3.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.1.1"
