@@ -52,6 +52,29 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   相鄰配對 `(i, i+1)`，只是為了先驗證 pipeline 跑得通；`pairs=None` 仍維持
   「窮舉全配對」的字面語意，不會被這個 smoke test 策略偷偷取代。
 
+## 已知的限制
+- 海面影像的 SIFT inlier 密度天生偏低，這是資料本身的限制，不是實作問題。
+  用 `data/smoke/` 兩張相鄰影像（0352 vs 0353）做過一次對照實驗：
+  - `cv2.BFMatcher(cv2.NORM_L2, crossCheck=True)`：match_count=11283，
+    inlier_count=7，inlier_ratio≈0.0006（幾乎全是雜訊，crossCheck 對這批
+    影像不適用，會接受大量模糊匹配）。
+  - `cv2.BFMatcher(cv2.NORM_L2).knnMatch(k=2)` + Lowe's ratio test
+    （ratio=0.75）：match_count=289，inlier_count=40，inlier_ratio≈0.1384
+    （比 crossCheck 好 230 倍，但仍遠低於一般陸地場景常見的 >0.3）。
+  - 結論：正式的 SIFT matcher 實作定案用 knnMatch + ratio test，不要用
+    crossCheck。但即使排除 crossCheck 的雜訊，inlier_ratio 仍只有 13.8%，
+    代表海面紋理重複性高（波浪造成大量相似 descriptor）本身就會限制
+    feature-based matching 的可靠對應點密度，這是真實存在的限制，不是
+    matcher 調參可以完全解決的問題。
+  - 這正是本專案採用「feature matching + GPS anchor 兜底」混合式架構的
+    理由（見上面「已知的暫緩事項」與 posegraph.py 的 GPSAnchor）：純靠
+    feature matching 建出的 pose graph 在低 inlier 密度時連通性/穩健度
+    不足，需要 GPS 軟性錨點補強。
+  - 這組數字（13.8% baseline inlier_ratio，0352 vs 0353）可以當作之後
+    評估是否要導入 RoMa 等 dense matcher 的比較基準線。
+  - 正式的 SIFT matcher（含 ratio test）與是否要導入 RoMa，留到
+    feature-based pipeline 任務時再一起做，目前不動手實作。
+
 ## 目前狀態
 - [x] SSH + VS Code Remote-SSH + Claude Code CLI 環境
 - [x] 專案骨架
