@@ -45,6 +45,12 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   10 月拿到正式資料與規格後，重新評估是否完整實作這兩個模組。
 - 這個決定的影響：拼接結果會是像素空間的 mosaic，相對位置關係正確，
   但無法回答「這張圖對應實際多少平方公尺」或跟外部資料集做絕對座標比對。
+- estimate.py 的 `estimate_all_pairs(pairs=...)`：`pairs` 參數的長期設計意圖是接上
+  GPS 距離篩選（用 geo/projection.py 的局部平面座標算候選對），取代窮舉全配對，
+  但這套通用邏輯留到 10 月接上正式資料集、metadata 格式底定後再做。目前
+  smoke test（data/smoke/ 10 張連續飛行序列）用 `sequential_pairs()` 明確傳入
+  相鄰配對 `(i, i+1)`，只是為了先驗證 pipeline 跑得通；`pairs=None` 仍維持
+  「窮舉全配對」的字面語意，不會被這個 smoke test 策略偷偷取代。
 
 ## 目前狀態
 - [x] SSH + VS Code Remote-SSH + Claude Code CLI 環境

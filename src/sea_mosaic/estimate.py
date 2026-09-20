@@ -11,6 +11,19 @@ from sea_mosaic.matcher import Matcher
 from sea_mosaic.types import PairResult
 
 
+def sequential_pairs(images: dict[int, np.ndarray]) -> list[tuple[int, int]]:
+    """Return consecutive-neighbor pairs (i, i+1) in ascending key order.
+
+    Pairing is based on sorted dict-key order, not on key values being
+    contiguous — image indices need not be 0..N-1 or gap-free. Intended as an
+    explicit, opt-in strategy (e.g. for a linear flight-sequence smoke test),
+    not the default behind estimate_all_pairs's pairs=None (which stays
+    exhaustive all-pairs).
+    """
+    sorted_keys = sorted(images)
+    return list(zip(sorted_keys, sorted_keys[1:]))
+
+
 def match_pair(
     matcher: Matcher,
     image_a: np.ndarray,
