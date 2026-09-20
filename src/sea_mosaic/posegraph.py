@@ -83,7 +83,44 @@ def build_pose_graph(
     would risk reproducing the exact unit/weight imbalance already measured and
     documented in CLAUDE.md's 已知的限制 for data/smoke/.
     """
-    ...
+    edges = [
+        PoseGraphEdge(
+            src_index=pair_result.src_index,
+            dst_index=pair_result.dst_index,
+            relative_pose=pair_result.homography,
+            information=(pair_result.inlier_count / inlier_count_reference) * np.eye(6),
+        )
+        for pair_result in pair_results
+    ]
+
+    node_indices = {pair_result.src_index for pair_result in pair_results}
+    node_indices |= {pair_result.dst_index for pair_result in pair_results}
+    if gps_positions is not None:
+        node_indices |= set(gps_positions)
+
+    anchors_by_index: dict[int, GPSAnchor] = {}
+    if gps_positions is not None:
+        for image_index, position_m in gps_positions.items():
+            anchors_by_index[image_index] = GPSAnchor(
+                image_index=image_index,
+                position_xy=position_m * pixels_per_meter,
+                weight=1.0,
+            )
+
+    nodes = []
+    for image_index in sorted(node_indices):
+        gps_anchor = anchors_by_index.get(image_index)
+        if gps_anchor is not None:
+            initial_pose = _params_to_pose(
+                np.array([1.0, 0.0, gps_anchor.position_xy[0], gps_anchor.position_xy[1]])
+            )
+        else:
+            initial_pose = _params_to_pose(np.array([1.0, 0.0, 0.0, 0.0]))
+        nodes.append(
+            PoseGraphNode(image_index=image_index, initial_pose=initial_pose, gps_anchor=gps_anchor)
+        )
+
+    return PoseGraph(nodes=nodes, edges=edges, anchors=list(anchors_by_index.values()))
 
 
 def _pose_to_params(pose: np.ndarray) -> np.ndarray:

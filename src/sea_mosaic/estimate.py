@@ -83,4 +83,6 @@ def default_inlier_count_reference(pair_results: list[PairResult]) -> float:
     Returns np.nan for an empty pair_results (no data to compute a reference from — per
     CLAUDE.md constraint 5, never fabricate a number here).
     """
-    ...
+    if not pair_results:
+        return float(np.nan)
+    return float(np.median([pair_result.inlier_count for pair_result in pair_results]))

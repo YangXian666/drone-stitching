@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from sea_mosaic.posegraph import build_pose_graph, optimize_pose_graph
 from sea_mosaic.types import GlobalTransforms, PairResult
 
 
@@ -33,4 +34,10 @@ def compose_global_transforms(
     computed from its own pair_results rather than picking one blindly; computing and
     passing it is the caller's responsibility, not this function's.
     """
-    ...
+    graph = build_pose_graph(
+        pair_results,
+        gps_positions,
+        pixels_per_meter=pixels_per_meter,
+        inlier_count_reference=inlier_count_reference,
+    )
+    return optimize_pose_graph(graph, reference_index=reference_index)

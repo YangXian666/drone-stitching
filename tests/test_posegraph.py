@@ -9,6 +9,7 @@ np.random, per this repo's existing test convention).
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from sea_mosaic.posegraph import (
     GPSAnchor,
