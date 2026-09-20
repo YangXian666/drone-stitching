@@ -1,0 +1,7 @@
+.env
+*.key
+outputs/
+data/
+__pycache__/
+*.tif
+.venv/
