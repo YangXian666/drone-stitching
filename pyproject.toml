@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "sea-mosaic"
+version = "0.1.0"
+description = "Drone sea-surface image stitching pipeline with georeferenced mosaic + quality metrics"
+authors = ["b12611024@ntu.edu.tw"]
+packages = [{ include = "sea_mosaic", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+numpy = "^2.5.3"
+pandas = "^3.0.6"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.1.1"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
