@@ -82,4 +82,13 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
 - [x] EXIF/XMP 解析 (GPS 座標讀取 + 局部平面投影，21/21 tests passing)
 - [ ] direct georeferencing (geo/camera.py, geo/direct.py) 仍暫緩，見「已知的暫緩事項」
 - [ ] feature-based pipeline
+  - [x] estimate.py: sequential_pairs + match_pair/estimate_all_pairs
+    (SIFT + RANSAC, 43/43 tests passing)
+  - [x] posegraph.py: optimize_pose_graph (Sim(2) 最小二乘 + GPS anchor，
+    45/45 tests passing，另用不對稱合成資料驗證過 node index 對應正確)
+  - [ ] posegraph.py: build_pose_graph (從真實 PairResult + GPS 座標建圖)
+  - [ ] compose.py: compose_global_transforms
+  - [ ] warp.py
+  - [ ] blend.py
+  - [ ] pipeline.py: 串接 estimate → compose → warp → blend
 - [ ] FastAPI
