@@ -36,8 +36,8 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
 
 ## 目前狀態
 - [x] SSH + VS Code Remote-SSH + Claude Code CLI 環境
-- [ ] 專案骨架
-- [ ] metrics.py + unit tests
+- [x] 專案骨架
+- [x] metrics.py + unit tests
 - [ ] EXIF/XMP 解析
 - [ ] direct georeferencing
 - [ ] feature-based pipeline
