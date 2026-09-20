@@ -76,4 +76,6 @@ class ProcessStats:
     @property
     def stitch_success_rate(self) -> float:
         """successful_image_count / input_image_count; np.nan if input_image_count == 0."""
-        ...
+        if self.input_image_count == 0:
+            return np.nan
+        return self.successful_image_count / self.input_image_count
