@@ -136,6 +136,100 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     inlier_count 的 median），取代先前用單一邊 `inlier_count=40` 當
     reference 的版本（40 是離群值、不具代表性，已被這次完整 9 邊驗證
     推翻）。`pixels_per_meter≈28.703` 的換算方式維持不變。
+- **`compose_global_transforms` 的旋轉/縮放子空間會嚴重退化（scale 崩潰、
+  旋轉不連續甚至變號），根因有兩層，已確定修法方向是新增 `YawAnchor`，
+  但 `YawAnchor` 本身還沒實作（見下面「目前狀態」）**。用 `data/smoke/`
+  全部 10 張真實影像、9 條真實邊（真的 SIFT+ratio-test matcher，不是
+  合成資料）做過完整診斷，過程與結論如下：
+  - **症狀**：GPS-anchored 版本裡，node 1、2、3 的 scale（`sqrt(a²+b²)`）
+    分別是 0.169、0.244、0.226（遠低於 0.8 的合理下限，等於把影像壓縮
+    成不到 1/4 大小），旋轉角度完全不連續甚至變號（-59.4°→-13.7°→
+    +28.0°），跟真實 `GimbalYawDegree` 反映的偏航變化趨勢（0°→-62.2°→
+    -93.6°→-143.3°）完全對不上。這個狀態如果不修，`warp.py` 會直接
+    顯形成扭曲影像，不能帶著往下走。
+  - **對照實驗排除了「融合有效、只是剛好接近 GPS」的可能性**：拿同一批
+    9 條真實邊跑 `compose_global_transforms(gps_positions=None, ...)`
+    （純 edge 約束，不用 GPS anchor），結果跟 GPS-anchored 版本的座標
+    差距最大到 194m；但 edge-only 版本的旋轉角度（-61.6°→-92.6°→
+    -140.9°，之後持平）反而跟真實 `GimbalYawDegree` 高度吻合——證明
+    homography 的旋轉分量本身是可信的物理訊號，問題出在 GPS-anchored
+    版本裡這個訊號被結構性壓制，不是訊號本身有問題。
+  - **根因 1**：`GPSAnchor` 的殘差公式只用 `pose[:2,2]`（tx,ty），從來
+    不碰 `pose[:2,0:2]`（a,b，即旋轉/縮放）。當強力的平移 anchor 把某個
+    node 的 tx,ty 拉向一個跟 homography 隱含平移不一致的位置時，唯一能
+    吸收這個矛盾的自由度就是旋轉/縮放，而這個問題在低 inlier 邊（0→1、
+    1→2，inlier_count=40，information 被 median 正規化壓到只剩 0.0215，
+    是其他邊的 1/18～1/76）相鄰的 node 上最嚴重，因為那裡幾乎沒有任何
+    有效約束在管旋轉/縮放。
+  - **根因 2（比根因 1 更根本，獨立於 GPS anchor 存不存在）**：
+    `information = (inlier_count/inlier_count_reference) * eye(6)` 這個
+    設計，對 6 維殘差向量 `(predicted - relative_pose)[:2,:].flatten()`
+    裡的旋轉分量（index `{0,1,3,4}`，無因次矩陣元素，量級 0.02～1.5）和
+    平移分量（index `{2,5}`，像素單位，量級 500～2500）套用同一個純量
+    係數。用真實 9 條邊在初始猜測狀態下實測：`full_raw`/`full_wtd`
+    幾乎完全等於 `trans_raw`/`trans_wtd`（例如 0→1 邊 `full_raw=2322.524`
+    vs `trans_raw=2322.523`），旋轉子區塊（`rot_wtd`，範圍 0.0164～
+    0.4615）在混合 norm 裡幾乎不可見。也就是說**不管 information 係數
+    設多少，edge 殘差對旋轉分量施加的有效壓力永遠遠低於對平移分量的壓力
+    （相差 3～4 個數量級）**——這是一個獨立於 GPS anchor 之外，
+    `optimize_pose_graph` 核心殘差公式本身就有的單位失衡問題。**這個
+    問題這次先記錄、不處理**（不在 `YawAnchor` 這次順手改動核心殘差
+    邏輯），但已列為獨立的架構待辦（見下面「目前狀態」），因為它比
+    `YawAnchor` 的 weight 調校更根本，屬於另一類問題。
+  - **`YawAnchor` 設計定案（尚未實作）**：
+    - 資料流分工：`io_utils.load_gimbal_yaw`（已實作，63/63 tests
+      passing）只讀 raw `GimbalYawDegree`（XMP-only，無 EXIF 對應項）→
+      之後在 `geo/projection.py` 新增一個跟 `project_gps_positions` 對稱
+      的 `project_gimbal_yaw_degrees`（純粹算相對 origin 的 wrap 角度，
+      不知道 Sim(2)/homography）→ 符號翻轉（`H_angle ≈ -relative_yaw`，
+      驗證見下方）+ 轉單位向量的邏輯放在 `posegraph.py`（pose-graph
+      專屬知識，不外露到 `geo/projection.py`）。
+    - `YawAnchor` dataclass 跟 `GPSAnchor` 平行（`image_index`、
+      `target_vector`，即 `[cos θ_target, sin θ_target]`、`weight`），
+      不做成通用「殘差類型」抽象——目前只有 2 種 anchor，還不到需要
+      抽象化的規模（Rule of Three），先讓兩個 dataclass 形狀一致，方便
+      以後真的出現第三種時再升級成共用介面。`PoseGraph` 新增
+      `yaw_anchors: list[YawAnchor]` 欄位（給 `default_factory=list`，
+      不破壞現有直接建構 `PoseGraph(...)` 的呼叫點）。殘差公式
+      `pose[:2,0] - anchor.target_vector`，隱含約束 `scale≈1`（這批
+      影像飛行高度只變動 <0.1%，`scale≈1` 本來就該成立，不用另外設計
+      scale 欄位）。
+    - `build_pose_graph` 新增 `gimbal_yaw: dict[int, float] | None = None`
+      （跟現有 `gps_positions` 一樣可選——沒有 yaw 資料時退回目前狀態，
+      仍是合法的 pose graph）+ `yaw_anchor_weight: float | None = None`
+      （必填但用執行期檢查而非型別系統強制：`gimbal_yaw` 給了、
+      `yaw_anchor_weight` 卻是 `None` 要 raise，不能靜默套用未驗證的
+      預設值，跟 `pixels_per_meter`/`inlier_count_reference` 同樣的
+      原則——量級沒驗證過就不能預設）。
+  - **符號翻轉關係驗證（9 條邊全數驗證，不是只挑吻合的兩條）**：
+    `residual = H_angle - (-relative_yaw)` 在 9 條邊上落在 -1.52°～
+    +0.67°（mean≈-0.30°，std≈0.68°），且**最關鍵的發現**是兩條低 inlier
+    的邊（0→1、1→2，inlier_count=40）的殘差（-0.124°、+0.029°）是全部
+    9 條邊裡最小的兩個，反而比某些高 inlier 邊（2→3，717 inlier，殘差
+    -1.519°）更準——證明這兩條邊的旋轉分量本身完全可信，只是被
+    information 正規化壓到失聲，`YawAnchor` 能救回一個結構性被消音、
+    但本身是對的訊號。**樣本限制附帶條件**：這 9 條邊只來自單一飛行
+    高度、單一直線飛行序列，9 條裡只有 3 條有實際偏航變化，尚未涵蓋
+    轉彎/爬升等更複雜飛行動作——10 月拿到正式資料集後，如果飛行模式
+    更複雜，這個符號翻轉關係要重新驗證，不能直接沿用。
+  - **weight 量級診斷（用跟 `pixels_per_meter`/`inlier_count_reference`
+    同樣的方式，不能憑感覺選係數）**：在初始猜測狀態下比較，yaw anchor
+    的原始殘差（node1~9 分別是 1.033、1.458、之後持平 1.898）要跟 edge
+    殘差的「旋轉子區塊」`rot_wtd`（9 條邊範圍 0.0164～0.4615，中位數
+    0.0351）比，不是跟完整混合殘差 `full_wtd`（569.08，會被平移污染，
+    算出來的 weight≈300 會讓 `YawAnchor` 重演 GPS anchor 那種壓倒性
+    主導）。用 `rot_wtd` 中位數算出 `weight ≈ 0.0185`，建議起始值
+    **`weight≈0.02`，範圍 0.01～0.05**。
+- **`YawAnchor` 落地後，實質上會是旋轉分量的主要、甚至唯一有效約束
+  來源，不是單純的「補強」——這是根因 2（information 單位失衡）的直接
+  後果，是一個需要明確記錄的依賴風險，不只是附帶條件**：因為 edge
+  殘差對旋轉分量的約束力天生就遠弱於平移分量（見上面根因 2），加上
+  `YawAnchor` 之後，旋轉分量的可靠性幾乎完全取決於 `GimbalYawDegree`
+  這個 DJI 專屬 XMP 欄位存不存在、準不準。**如果未來某批影像（例如換了
+  非 DJI 機型，或 10 月正式資料集的 metadata 格式不同）沒有這個欄位，
+  `gimbal_yaw=None`，旋轉分量會退回到現在這個幾乎沒有任何有效約束的
+  狀態，而且目前的設計不會有任何警告或降級機制提示這件事發生了**。
+  已在下面「目前狀態」列成一個獨立的架構待辦。
 - **`io_utils.py` 的 `load_image`/`load_images` 仍是 `...` 空殼**（沒有真的用
   PIL/cv2 讀圖、也沒有測試覆蓋），已經在兩個不同任務裡各撞到一次：
   第一次是 SIFT `match_pair` 對照實驗（0352 vs 0353 inlier_ratio 診斷），
@@ -153,9 +247,9 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
 - [x] metrics.py + unit tests
 - [x] EXIF/XMP 解析 (GPS 座標讀取 + 局部平面投影，21/21 tests passing)
 - [x] io_utils.py: load_gimbal_yaw（XMP-only，無 EXIF 對應項，63/63 tests
-  passing）—— 為了支撐 YawAnchor 設計的第一步（見下面 feature-based
-  pipeline 清單），YawAnchor 本身（posegraph.py dataclass 設計、weight
-  量級驗證、CLAUDE.md 完整記錄根因）仍待完成，見下方待辦
+  passing）—— 為了支撐 YawAnchor（見下面 feature-based pipeline 清單），
+  YawAnchor 的設計與 weight 量級驗證已完成（見上面「已知的限制」），
+  剩下 TDD 實作
 - [ ] direct georeferencing (geo/camera.py, geo/direct.py) 仍暫緩，見「已知的暫緩事項」
 - [ ] feature-based pipeline
   - [x] estimate.py: sequential_pairs + match_pair/estimate_all_pairs
@@ -165,21 +259,28 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   - [x] posegraph.py: build_pose_graph (從真實 PairResult + GPS 座標建圖)
   - [x] compose.py: compose_global_transforms
   - [x] io_utils.py: load_gimbal_yaw（XMP-only，63/63 tests passing）
-  - [ ] posegraph.py: YawAnchor —— 用真實 data/smoke/ 資料診斷發現
-    compose_global_transforms 目前有嚴重的旋轉/縮放退化 bug（node scale
-    崩潰到 0.17～0.24、旋轉不連續甚至變號），根因是 GPS anchor 只約束
-    平移、完全不約束旋轉/縮放，低 inlier 邊的 information 又被 median
-    正規化壓到接近 0，導致這些 node 的旋轉/縮放實質上沒有任何訊號在管。
-    已用 GimbalYawDegree 驗證出可行的修法方向（符號翻轉關係
-    `H_angle ≈ -relative_yaw` 在 9 條邊上驗證通過，residual 落在
-    -1.52°~+0.67°，且低 inlier 的邊旋轉分量本身其實可信，只是被權重
-    壓到失聲），必須在 warp.py 之前修好，否則會在 warp 階段顯形成扭曲
-    影像。剩餘步驟：(1) posegraph.py 新增 YawAnchor dataclass 設計定案；
-    (2) 用真實數字驗證 yaw anchor weight 跟 position anchor weight=1.0
-    的量級對比（同 pixels_per_meter/inlier_count_reference 的驗證方式，
-    不可憑感覺選係數）；(3) 在 CLAUDE.md「已知的限制」完整記錄這次發現
-    的根因、機制、與符號翻轉驗證的樣本限制附帶條件（僅 9 條邊、單一飛行
-    高度、僅 3 段實際偏航變化，尚未涵蓋轉彎/爬升等更複雜飛行動作）
+  - [ ] posegraph.py: YawAnchor TDD 實作 —— 設計與 weight 量級已定案
+    （見上面「已知的限制」，包含符號翻轉驗證、dataclass 形狀、
+    build_pose_graph 簽名、`weight≈0.02`（範圍 0.01～0.05）），只剩
+    照 TDD 流程寫測試（先紅）→ 實作（後綠）。必須在 warp.py 之前修好，
+    否則現有的旋轉/縮放退化 bug 會在 warp 階段顯形成扭曲影像。
+  - [ ] posegraph.py: optimize_pose_graph 的 information 單位失衡 ——
+    獨立於 YawAnchor 之外的架構問題（見上面「已知的限制」根因 2）：
+    `information = coef * eye(6)` 對混合了平移（像素單位，量級
+    500～2500）與旋轉/縮放（無因次，量級 0.02～1.5）的 6 維殘差套用
+    同一個純量係數，導致不管係數設多少，edge 對旋轉分量的約束力永遠
+    比對平移分量弱 3～4 個數量級。這次刻意不修（YawAnchor 是先解決
+    眼前 bug 的獨立手段，不是這個問題的根本解），排在 YawAnchor 實作
+    之後、`load_image`/`load_images` 之前——因為這是 pose-graph
+    本身的正確性問題，比單純的 IO 空殼更貼近 warp.py 依賴的核心邏輯
+  - [ ] posegraph.py: YawAnchor 依賴風險 —— YawAnchor 落地後會是旋轉
+    分量的主要、甚至唯一有效約束來源（上面 information 單位失衡問題
+    的直接後果），旋轉分量的可靠性因此幾乎完全綁定 `GimbalYawDegree`
+    這個 DJI 專屬 XMP 欄位存不存在。需要在 build_pose_graph 或更上層
+    加一個明確的偵測/警告機制（例如 `gimbal_yaw=None` 時記一筆 log 或
+    某種狀態旗標），而不是讓旋轉分量安靜地退回無約束狀態卻沒人知道。
+    10 月正式資料集如果換了 metadata 格式，這個風險會直接浮現，必須在
+    那之前有个機制能察覺
   - [ ] io_utils.py: load_image/load_images 正式實作（含測試）—— 目前是
     `...` 空殼，已反覆在多個診斷任務裡被繞過（見上面「已知的限制」），
     排在 warp.py 之前，因為 warp.py 大機率也依賴它
