@@ -6,7 +6,7 @@ pose graph with GPS positions as anchors, never from chaining pairwise homograph
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -28,12 +28,30 @@ class GPSAnchor:
 
 
 @dataclass
+class YawAnchor:
+    """A GimbalYawDegree-derived rotation prior for one image, used as an anchor in
+    pose-graph optimization -- independent of GPSAnchor, which only constrains
+    translation (pose[:2,2]), never rotation/scale (pose[:2,0:2]).
+
+    target_vector is [cos(theta_target), sin(theta_target)] -- already including the
+    empirically-validated sign flip from relative GimbalYawDegree to this pose graph's
+    Sim(2) rotation convention (see _yaw_target_vector). Being a unit vector, comparing
+    a node's (a,b) against it in the optimization objective implicitly constrains
+    scale~=1 too, with no separate scale field needed."""
+
+    image_index: int
+    target_vector: np.ndarray  # shape (2,), unit vector [cos(theta_target), sin(theta_target)]
+    weight: float  # anchor confidence used in the optimization objective
+
+
+@dataclass
 class PoseGraphNode:
     """One image's pose node in the pose graph."""
 
     image_index: int
     initial_pose: np.ndarray  # 3x3 initial pose guess in the mosaic frame
     gps_anchor: GPSAnchor | None
+    yaw_anchor: YawAnchor | None = None
 
 
 @dataclass
@@ -48,11 +66,13 @@ class PoseGraphEdge:
 
 @dataclass
 class PoseGraph:
-    """The full pose graph to be optimized: nodes, pairwise edges, and GPS anchors."""
+    """The full pose graph to be optimized: nodes, pairwise edges, GPS anchors, and yaw
+    anchors."""
 
     nodes: list[PoseGraphNode]
     edges: list[PoseGraphEdge]
     anchors: list[GPSAnchor]
+    yaw_anchors: list[YawAnchor] = field(default_factory=list)
 
 
 def build_pose_graph(
@@ -61,8 +81,10 @@ def build_pose_graph(
     *,
     pixels_per_meter: float,
     inlier_count_reference: float,
+    gimbal_yaw: dict[int, float] | None = None,
+    yaw_anchor_weight: float | None = None,
 ) -> PoseGraph:
-    """Build a pose graph from pairwise estimates and optional GPS anchors.
+    """Build a pose graph from pairwise estimates and optional GPS/yaw anchors.
 
     Edges come from pair_results' homographies (not chained; relative_pose is each
     PairResult's homography as-is, since both already follow the src -> dst
@@ -82,7 +104,21 @@ def build_pose_graph(
     batch's inlier_count distribution respectively) — silently defaulting either one
     would risk reproducing the exact unit/weight imbalance already measured and
     documented in CLAUDE.md's 已知的限制 for data/smoke/.
+
+    Yaw anchors come from gimbal_yaw when provided: gimbal_yaw is expected in degrees,
+    relative to some origin (geo.projection.project_gimbal_yaw_degrees's output),
+    mirroring how gps_positions is expected already-projected. gimbal_yaw is optional
+    (None means no yaw anchors at all — a legitimate, fully-supported pose graph, same
+    as gps_positions=None; see CLAUDE.md's YawAnchor 依賴風險), but yaw_anchor_weight is
+    required whenever gimbal_yaw is given: its magnitude is dataset-specific (see
+    CLAUDE.md's weight validation) and must never silently default, same principle as
+    pixels_per_meter/inlier_count_reference. A node without its own gimbal_yaw entry
+    simply gets no YawAnchor (yaw_anchor=None), even when other nodes do — spotty
+    metadata coverage must not raise.
     """
+    if gimbal_yaw is not None and yaw_anchor_weight is None:
+        raise ValueError("yaw_anchor_weight is required when gimbal_yaw is given")
+
     edges = [
         PoseGraphEdge(
             src_index=pair_result.src_index,
@@ -97,6 +133,8 @@ def build_pose_graph(
     node_indices |= {pair_result.dst_index for pair_result in pair_results}
     if gps_positions is not None:
         node_indices |= set(gps_positions)
+    if gimbal_yaw is not None:
+        node_indices |= set(gimbal_yaw)
 
     anchors_by_index: dict[int, GPSAnchor] = {}
     if gps_positions is not None:
@@ -107,9 +145,19 @@ def build_pose_graph(
                 weight=1.0,
             )
 
+    yaw_anchors_by_index: dict[int, YawAnchor] = {}
+    if gimbal_yaw is not None:
+        for image_index, relative_yaw_deg in gimbal_yaw.items():
+            yaw_anchors_by_index[image_index] = YawAnchor(
+                image_index=image_index,
+                target_vector=_yaw_target_vector(relative_yaw_deg),
+                weight=yaw_anchor_weight,
+            )
+
     nodes = []
     for image_index in sorted(node_indices):
         gps_anchor = anchors_by_index.get(image_index)
+        yaw_anchor = yaw_anchors_by_index.get(image_index)
         if gps_anchor is not None:
             initial_pose = _params_to_pose(
                 np.array([1.0, 0.0, gps_anchor.position_xy[0], gps_anchor.position_xy[1]])
@@ -117,10 +165,20 @@ def build_pose_graph(
         else:
             initial_pose = _params_to_pose(np.array([1.0, 0.0, 0.0, 0.0]))
         nodes.append(
-            PoseGraphNode(image_index=image_index, initial_pose=initial_pose, gps_anchor=gps_anchor)
+            PoseGraphNode(
+                image_index=image_index,
+                initial_pose=initial_pose,
+                gps_anchor=gps_anchor,
+                yaw_anchor=yaw_anchor,
+            )
         )
 
-    return PoseGraph(nodes=nodes, edges=edges, anchors=list(anchors_by_index.values()))
+    return PoseGraph(
+        nodes=nodes,
+        edges=edges,
+        anchors=list(anchors_by_index.values()),
+        yaw_anchors=list(yaw_anchors_by_index.values()),
+    )
 
 
 def _pose_to_params(pose: np.ndarray) -> np.ndarray:
@@ -132,6 +190,34 @@ def _params_to_pose(params: np.ndarray) -> np.ndarray:
     """Build a Sim(2) pose matrix from (a, b, tx, ty)."""
     a, b, tx, ty = params
     return np.array([[a, -b, tx], [b, a, ty], [0.0, 0.0, 1.0]])
+
+
+def _yaw_target_vector(relative_yaw_deg: float) -> np.ndarray:
+    """Convert a relative GimbalYawDegree reading (geo.projection.project_gimbal_yaw_
+    degrees's output: a compass-bearing delta, degrees, relative to some origin image)
+    into this pose graph's Sim(2) rotation target, [cos(theta_target), sin(theta_target)].
+
+    theta_target = relative_yaw_deg directly, with NO extra sign flip -- see CLAUDE.md's
+    已知的限制 for the full derivation and the story of an earlier, buggy version of this
+    function that used -relative_yaw_deg instead. In short: CLAUDE.md's validated
+    `H_angle ~= -relative_yaw` is about a single EDGE's own relative_pose (inv(pose_dst)
+    @ pose_src) decomposition, one matrix inversion away from a NODE's absolute rotation
+    angle (pose_dst = pose_src @ inv(relative_pose), and inverting a pure rotation
+    negates its angle again) -- the two sign flips cancel, leaving
+    node_angle = relative_yaw directly. Confirmed against data/smoke/'s real edge-only
+    (no anchors at all) optimize_pose_graph run: nodes 1/2/3 converged to
+    -61.584/-92.584/-140.876deg, matching their real relative_yaw of
+    -62.200/-93.600/-143.300deg directly, not negated.
+
+    This is a validation covering a single straight-line flight at one altitude and
+    should be re-checked if a future dataset's flight pattern is more complex (e.g.
+    turns, climbs).
+
+    The result is always a unit vector, which is why YawAnchor needs no separate scale
+    field: comparing a node's (a,b) against this target implicitly constrains scale~=1.
+    """
+    theta_target_rad = np.radians(relative_yaw_deg)
+    return np.array([np.cos(theta_target_rad), np.sin(theta_target_rad)])
 
 
 def optimize_pose_graph(graph: PoseGraph, reference_index: int = 0) -> GlobalTransforms:
@@ -175,6 +261,9 @@ def optimize_pose_graph(graph: PoseGraph, reference_index: int = 0) -> GlobalTra
         for anchor in graph.anchors:
             position_error = poses[anchor.image_index][:2, 2] - anchor.position_xy[:2]
             residual_terms.append(anchor.weight * position_error)
+        for yaw_anchor in graph.yaw_anchors:
+            rotation_error = poses[yaw_anchor.image_index][:2, 0] - yaw_anchor.target_vector
+            residual_terms.append(yaw_anchor.weight * rotation_error)
         if not residual_terms:
             return np.zeros(0)
         return np.concatenate(residual_terms)

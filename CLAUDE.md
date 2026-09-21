@@ -230,6 +230,172 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   `gimbal_yaw=None`，旋轉分量會退回到現在這個幾乎沒有任何有效約束的
   狀態，而且目前的設計不會有任何警告或降級機制提示這件事發生了**。
   已在下面「目前狀態」列成一個獨立的架構待辦。
+  **`weight≈0.02` 這個設計已知的能力邊界**：這個量級是用真實邊的
+  info-weighted「旋轉子區塊」殘差（`rot_wtd`，範圍 0.0164～0.4615）
+  校準出來的，對應的是「輕微的旋轉分歧」——例如這批真實資料裡兩條低
+  inlier 邊（0→1、1→2）的情況：旋轉本身其實是準的，只是被 information
+  正規化壓到失聲。**這個 weight 救不回「旋轉本身嚴重錯誤」的情況**
+  （不管 inlier_count 高低都可能發生，因為已經驗證過兩者不相關，見
+  上面符號翻轉驗證的第 3 點）：用合成資料實測，同樣的嚴重旋轉錯誤（差
+  130°）在 `weight=5.0` 才能被拉回（誤差降到 ~3°），但在 `weight=0.02`
+  幾乎完全拉不動（結果跟完全沒有 yaw anchor 幾乎一樣，差距只有
+  ~0.01°）——這個能力邊界已經用測試鎖定
+  （`test_optimize_pose_graph_production_yaw_weight_cannot_rescue_severe_rotation_error`），
+  不是現在要解決的問題，只是要明確記錄：**`YawAnchor` 不是萬能的旋轉
+  修正機制，只能處理「訊號本身是對的、只是被結構性消音」這一類問題**，
+  遇到真正嚴重的旋轉錯誤時，跟完全沒有 `YawAnchor` 的狀態沒有實質差別。
+- **`_yaw_target_vector` 曾經有一個符號 bug，已修正——這個 bug 本身、
+  它為什麼發生、以及為什麼自動化測試沒攔到它，比修正的公式本身更值得
+  記錄**：
+  - **錯的公式**：`theta_target = -relative_yaw_deg`。**對的公式**：
+    `theta_target = relative_yaw_deg`（不取負號）。
+  - **為什麼會犯這個錯**：CLAUDE.md 已經驗證過 `H_angle ≈ -relative_yaw`
+    這個關係（見上面符號翻轉驗證的段落），這件事本身沒有錯——但
+    `H_angle` 是**edge 的 `relative_pose`**（`inv(pose_dst) @ pose_src`）
+    分解出來的角度，不是 `YawAnchor` 實際要約束的**node 絕對姿態角度**。
+    從 edge 的角度換算到 node 的角度，中間還有一次矩陣求逆：
+    `pose_dst = pose_src @ inv(relative_pose)`，對純旋轉而言，求逆會把
+    角度再變號一次：`node_angle = -H_angle = -(-relative_yaw) =
+    +relative_yaw`——兩次變號互相抵銷。設計 `_yaw_target_vector` 時漏掉
+    了「node 角度 = -H_angle」這一步中間的求逆變號，把 edge 層級驗證過
+    的符號關係直接套用到 node 層級的目標公式上，等於少變號一次。
+  - **為什麼測試沒攔到**：`test_yaw_target_vector_applies_validated_sign_flip`
+    當初的期望值是用同一個（錯的）推導手算出來的——期望值和實作犯了
+    同一個錯，兩者自然吻合、測試綠燈，但驗證的是「實作是否符合我自己
+    （錯誤）的理解」，不是「實作是否符合真實物理」。其餘會用到
+    `_yaw_target_vector` 的測試（`build_pose_graph` 相關）在比對期望值時
+    也是直接呼叫 `_yaw_target_vector` 本身去算期望值（`anchor.target_vector
+    == pytest.approx(_yaw_target_vector(relative_yaw_deg))`），這種「用
+    同一個函式算期望值」的寫法對任何函式內部的系統性錯誤都是免疫的、
+    抓不到。真正涉及旋轉數值的整合測試（`optimize_pose_graph` 的隔離
+    拉力測試、嚴重退化救援測試）則是直接用 `cos`/`sin` 手算
+    `target_vector`，完全不經過 `_yaw_target_vector`，所以也没機會踩到
+    這個 bug——這些測試驗證的是「`optimize_pose_graph` 的殘差公式接線
+    正確」，從設計上就沒有涵蓋「`relative_yaw` 轉 `target_vector` 這個
+    轉換方向對不對」這件事。
+  - **後來怎麼抓到的**：不是靠測試，是靠**用真實 `data/smoke/` 資料重跑
+    一次「拉不動」的 weight sweep 時發現異常**——把 `weight` 從 0.02
+    拉到 10.0，node1 的角度幾乎紋風不動，而且用（當時還是錯的）目標角度
+    去算「node 4~9 離目標差多少」時，跑出 228°~238° 這種明顯不合理的
+    數字，回頭重新推導才抓到。這組「拉不動」的 weight sweep 數字因此
+    整批作廢，需要修正符號後重新跑一次才可信。
+  - **這件事證明了什麼**：這個 session 一路堅持的「不能只看合成測試綠燈
+    就當作完成，要用真實資料驗證」這個方法論最終確實有效——真的抓到了
+    一個合成測試設計上結構性看不見的 bug。但也要誠實承認：這次是靠**用
+    真實資料的最終行為（拉不動）反推出數字不合理**才抓到的，不是靠更
+    嚴謹的測試設計主動攔截的——如果當初有一條測試是「用 `load_gimbal_yaw`
+    +`project_gimbal_yaw_degrees` 的真實輸出餵給 `_yaw_target_vector`，
+    再檢查算出來的角度是否讓 edge-only（無 anchor）的已知收斂結果得到
+    低殘差」，這類**串接真實資料端到端、且期望值來自獨立驗證過的其他
+    資料（不是同一個函式自我比對）**的測試，理論上應該要能在 TDD 階段
+    就攔到這個 bug，而不必等到用生產 weight 在真實資料上跑出異常才發現。
+- **修正符號 bug 後重新驗證：`YawAnchor` 在真實資料上，`weight` 從
+  0.02 調到 10.0 都救不回退化，而且發現退化其實影響全部 9 個 node，
+  不只是原本判定的 node1/2/3——這組發現最終指向 `optimize_pose_graph`
+  的殘差公式本身有一個經典的 Sim(2) pose-graph 耦合陷阱，需要重新設計，
+  但這次刻意不動手實作，完整記錄在這裡，留給下一個 session 處理**：
+  - **修正符號後的 weight sweep 結果（真實 9 條邊，`weight` ∈
+    {0.02, 0.5, 1.0, 2.0, 5.0, 10.0}）**：`residual_error` 隨 weight
+    增加持續惡化（0.2020 → 2.8890，漲了 14 倍），但 node1/2/3 的角度
+    誤差幾乎不動（node1 穩定在 2.77°——其實從一開始就沒有嚴重偏離，
+    真正的問題是 scale 卡在 0.169～0.170 動不了；node2 誤差 79.9°→
+    77.6°，只改善 2.3°；node3 誤差 171.3°，完全不動）。**意外發現**：
+    node4～9（先前因為 scale 維持在 0.81～1.09 而被判定「健康」）的
+    旋轉角度其實一直跟真實 `GimbalYawDegree` 差 47.8°～58.6°，這個
+    誤差在整個 weight sweep 裡也幾乎不動——「只看 scale 判斷健康與否」
+    是不完整的判準。
+  - **三步排查，排除了「又是一個符號 bug」的可能性**：(1) 用真實數字
+    驗證 `project_gimbal_yaw_degrees[9]` 精確等於
+    `GimbalYawDegree[9]-GimbalYawDegree[0]`（wrap 後），10/10 個 node
+    全部吻合，函式本身沒問題；(2) 純 edge 鏈（無 GPS anchor）本身的
+    旋轉一路都準（node9 只偏了 6.58°，屬於 9 段真實雜訊合理累積量級），
+    證明目標角度公式是對的，偏差不是計算錯誤；(3) 拿純 edge 鏈的實際
+    收斂角度對照「逐邊 `H_angle` 手動累加」的天真預測，差距隨鏈長平緩
+    遞增到 3.9°（3→9 node），量級跟真實雜訊累積一致，不是被漏轉一次
+    符號那種量級（那種 bug 差距應該接近 60°或 120°這種數量級，不會是
+    平滑遞增的個位數度數）。**結論：目標角度計算本身沒有第二個 bug，
+    GPS anchor 一旦加入，確確實實會把整條鏈的旋轉拉偏 48°～171°不等，
+    是一個真實現象。**
+  - **逐邊隔離實驗：證明退化是每條邊獨立發生，不是從 node1 傳染過來**。
+    對 9 條真實邊逐一做「只留 src、dst 兩個 node + 各自 GPS anchor +
+    這一條邊，完全不接其他 node」的隔離實驗（`reference_index=src`），
+    結果：
+
+    | edge | info_coef | 隔離後 scale | 隔離後相對角度 | 真實相對偏航 | 隔離誤差 |
+    |------|----------:|-------------:|---------------:|-------------:|---------:|
+    | 0→1 | 0.0215 | 0.1690 | -59.435° | -62.200° | 2.765° |
+    | 1→2 | 0.0215 | 0.2443 | -13.692° | -31.400° | 17.708° |
+    | 2→3 | 0.3853 | 0.2259 | 28.003° | -49.700° | 77.703° |
+    | 3→4 | 1.0000 | 1.0204 | -94.826° | 0.000° | 94.826° |
+    | 4→5 | 0.9957 | 0.9553 | -89.980° | 0.000° | 89.980° |
+    | 5→6 | 1.2923 | 1.0919 | -95.506° | 0.000° | 95.506° |
+    | 6→7 | 1.1779 | 1.0624 | -89.137° | 0.000° | 89.137° |
+    | 7→8 | 1.5067 | 0.9056 | -84.746° | 0.000° | 84.746° |
+    | 8→9 | 1.6448 | 0.8105 | -88.880° | 0.000° | 88.880° |
+
+    **每一條邊單獨拿出來都出現嚴重退化**，包括在全鏈裡看起來「健康」的
+    3→4 到 8→9（單獨拿出來角度誤差高達 84.7°～95.5°，一點都不健康，
+    只是在全鏈裡因為彼此誤差方向接近、相對誤差小，被掩蓋成「看起來
+    健康」）。這推翻了「node1 是病灶、往後傳染」的假設，確認是「每一條
+    邊只要 GPS anchor 隱含位置跟 homography 隱含位置不一致，(a,b) 就會
+    獨立退化去吸收這個矛盾」——`information` 高低、node 在鏈上的位置、
+    上游有沒有先出問題，都不影響這個現象是否發生。
+  - **根因（Sim(2) pose-graph 的經典耦合陷阱）**：`optimize_pose_graph`
+    目前用 `predicted = inv(poses[dst]) @ poses[src]` 算完整個矩陣再跟
+    `relative_pose` 整包相減。對 Sim(2) 矩陣求逆會產生 `1/(scale²)` 這種
+    項，讓平移殘差的數值透過矩陣乘法「污染」進旋轉/縮放子空間——當
+    GPS anchor 把 `t_dst` 拉向一個跟 edge 隱含位置不一致的值時，
+    最小平方法發現讓 `(a,b)`（旋轉/縮放）退化到一個極端值，比讓
+    `t_dst` 動更「便宜」（見上面「已知的限制」中 information-vs-退化
+    幅度診斷：`information` 係數在 6 個數量級範圍內幾乎不影響退化程度，
+    證明問題不是權重，是殘差公式本身的耦合結構）。
+  - **修法：把殘差拆成獨立的旋轉子項和平移子項，不用 `atan2`（不影響
+    wraparound 顧慮），全程不對決策變數取逆**。從
+    `relative_pose ≈ inv(pose_dst) @ pose_src` 兩邊左乘 `pose_dst`：
+    `pose_dst @ relative_pose ≈ pose_src`。拆開旋轉/平移分量：
+    - 旋轉殘差（4 個數）：`R_dst @ R_rel − R_src`，其中
+      `R_rel = relative_pose[:2,:2]`（edge 資料本身的固定值，不是決策
+      變數，取它不需要求逆決策變數）。
+    - 平移殘差（2 個數）：`(t_dst + R_dst @ t_rel) − t_src`，其中
+      `t_rel = relative_pose[:2,2]`（同樣是固定資料）。
+
+    兩者都是決策變數（`R_src, R_dst, t_src, t_dst`）的線性/雙線性組合，
+    全程沒有對任何決策變數取逆——GPS anchor 對 `t_dst` 的拉力，只會
+    透過乘法線性傳到平移殘差，不會再透過 `inv()` 的 `1/(scale²)` 項滲進
+    旋轉子空間。`PairResult`、`PoseGraphEdge`、`PoseGraph`、`GPSAnchor`、
+    `YawAnchor` 這幾個 dataclass 的欄位/型別都不需要改；`edge.information`
+    還是同一個 6x6 矩陣，套用在重新組回的 6 維 `[旋轉殘差, 平移殘差]`
+    向量上，跟現在的寫法完全對稱。改動範圍侷限在
+    `optimize_pose_graph` 內部 `residuals()` closure 處理 `graph.edges`
+    的那個迴圈本體（約 10-15 行），函式簽名、資料結構全部不變。
+  - **範圍評估的三點結論**（詳細分類見對話紀錄，這裡記結論）：
+    (1) `tests/test_posegraph.py` 裡約 19 條測試（`build_pose_graph`
+    相關、`YawAnchor`/`_yaw_target_vector` 相關）完全不受影響，因為測的
+    是 `build_pose_graph` 產出的資料結構內容，不涉及
+    `optimize_pose_graph.residuals()` 內部算法；(2) 約 6 條測試
+    （`optimize_pose_graph`/`compose_global_transforms` 的收斂測試、
+    GPS anchor 救援測試、YawAnchor 旋轉退化救援測試）需要重跑確認仍然
+    通過，但這些測試全部是門檻式斷言（`error < X`、`< 0.3 * 其他值`），
+    不是手推精確數字，且合成真值多半旋轉為單位矩陣（舊公式耦合機制
+    影響最小的情況），預期會通過但不能只憑推論假設；(3) **0 條測試
+    需要重新手推期望值**。
+  - **⚠️ 明確標註：以下這些數字全部是在舊（有耦合陷阱的）殘差公式下
+    跑出來的，新公式實作完成後必須重新驗證是否還成立，不能沿用**：
+    - `inlier_count_reference = 1861`（median 校準）——這個數字本身
+      （這批 9 條邊 `inlier_count` 的 median）不會變，但它「能讓
+      information 發揮設計意圖」這個結論是在舊殘差公式下驗證的，新
+      公式下 information 係數影響退化程度的方式可能完全不同，需要
+      重新驗證。
+    - `YawAnchor` 的 `weight≈0.02`（範圍 0.01～0.05）建議值——完全是
+      在舊殘差公式下校準與驗證的（包含 `rot_wtd` 量級比較、合成資料的
+      weight=5.0 才能救援嚴重錯誤等結論），新公式解決了根本的耦合問題
+      後，`YawAnchor` 還需不需要、需要多大的 weight，都要重新評估——
+      新公式甚至可能讓 `YawAnchor` 變得不必要（如果 GPS anchor 不再
+      污染旋轉子空間，node 的旋轉可能直接由 edge 自己撐住）。
+    - **不受影響的部分**：`pixels_per_meter≈28.703` 這個換算方式**不受
+      影響**——它是純幾何推導（DFOV + 飛行高度算地面覆蓋），不依賴
+      `optimize_pose_graph` 的任何殘差計算，新公式上線後不需要重新
+      驗證這個數字。
 - **`io_utils.py` 的 `load_image`/`load_images` 仍是 `...` 空殼**（沒有真的用
   PIL/cv2 讀圖、也沒有測試覆蓋），已經在兩個不同任務裡各撞到一次：
   第一次是 SIFT `match_pair` 對照實驗（0352 vs 0353 inlier_ratio 診斷），
@@ -246,10 +412,10 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
 - [x] 專案骨架
 - [x] metrics.py + unit tests
 - [x] EXIF/XMP 解析 (GPS 座標讀取 + 局部平面投影，21/21 tests passing)
-- [x] io_utils.py: load_gimbal_yaw（XMP-only，無 EXIF 對應項，63/63 tests
-  passing）—— 為了支撐 YawAnchor（見下面 feature-based pipeline 清單），
-  YawAnchor 的設計與 weight 量級驗證已完成（見上面「已知的限制」），
-  剩下 TDD 實作
+- [x] io_utils.py: load_gimbal_yaw（XMP-only，無 EXIF 對應項）+
+  posegraph.py: YawAnchor（設計、weight 量級驗證、TDD 實作皆完成，
+  86/86 tests passing，見下面 feature-based pipeline 清單與上面
+  「已知的限制」）
 - [ ] direct georeferencing (geo/camera.py, geo/direct.py) 仍暫緩，見「已知的暫緩事項」
 - [ ] feature-based pipeline
   - [x] estimate.py: sequential_pairs + match_pair/estimate_all_pairs
@@ -259,11 +425,38 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   - [x] posegraph.py: build_pose_graph (從真實 PairResult + GPS 座標建圖)
   - [x] compose.py: compose_global_transforms
   - [x] io_utils.py: load_gimbal_yaw（XMP-only，63/63 tests passing）
-  - [ ] posegraph.py: YawAnchor TDD 實作 —— 設計與 weight 量級已定案
-    （見上面「已知的限制」，包含符號翻轉驗證、dataclass 形狀、
-    build_pose_graph 簽名、`weight≈0.02`（範圍 0.01～0.05）），只剩
-    照 TDD 流程寫測試（先紅）→ 實作（後綠）。必須在 warp.py 之前修好，
-    否則現有的旋轉/縮放退化 bug 會在 warp 階段顯形成扭曲影像。
+  - [x] posegraph.py: YawAnchor TDD 實作 —— `geo/projection.py` 新增
+    `project_gimbal_yaw_degrees`；`posegraph.py` 新增 `YawAnchor`
+    dataclass、`PoseGraphNode.yaw_anchor`/`PoseGraph.yaw_anchors` 欄位、
+    私有 helper `_yaw_target_vector`（符號翻轉 + 單位向量）；
+    `build_pose_graph` 新增 `gimbal_yaw`/`yaw_anchor_weight` 參數（含
+    執行期必填檢查）；`optimize_pose_graph` 的 `residuals()` 接上
+    yaw anchor 殘差項。88/88 tests passing（新增 24 個：
+    `test_projection.py` 4 個、`test_posegraph.py` 18 個、
+    `test_compose.py` 2 個），含兩個明確鎖定的能力邊界測試——優雅退化
+    （`gimbal_yaw=None`/局部缺失時不報錯、`yaw_anchors=[]` 時行為跟之前
+    完全一致）與 `weight≈0.02` 救不回嚴重旋轉錯誤（見上面「已知的
+    限制」）。**用真實 `data/smoke/` 資料驗證時發現一個實作疏漏**：
+    `compose.py` 的 `compose_global_transforms`（公開介面，`pipeline.py`
+    未來會呼叫的入口）當初沒有跟著更新去接收/轉發 `gimbal_yaw`/
+    `yaw_anchor_weight` 給 `build_pose_graph`，導致 `YawAnchor` 雖然在
+    `posegraph.py` 層級測試全綠，透過公開介面卻完全用不到（`TypeError`）
+    ——這正是「只看合成測試綠燈不夠」的活教材，已補上轉發邏輯與對應
+    2 個測試（`ValueError` 轉發、真實 rescue 效果透過完整路徑驗證）。
+  - [ ] posegraph.py: 重新設計 optimize_pose_graph 的殘差公式（旋轉/
+    平移解耦）—— **排序最前面，優先於下面兩項**，因為用真實資料驗證
+    `YawAnchor` 時發現退化其實影響全部 9 個 node（不只 node1/2/3），
+    且 `weight` 調到 10.0 都救不回，逐邊隔離實驗證明這是
+    `optimize_pose_graph` 殘差公式本身的 Sim(2) 耦合陷阱（`inv()` 讓
+    平移殘差透過 `1/(scale²)` 污染旋轉子空間），不是 `YawAnchor` 的
+    weight 沒調對，也不是哪個 node 的問題——完整推導、逐邊隔離實驗數據、
+    新公式設計（`R_dst @ R_rel − R_src` / `(t_dst + R_dst @ t_rel) −
+    t_src`，全程不對決策變數取逆）、範圍評估都記在上面「已知的限制」。
+    下一個 session 從這裡開始，照 TDD 走：先確認 ~6 條受影響測試改公式
+    後仍通過，再重新驗證 `inlier_count_reference`/`YawAnchor weight`
+    這兩組數字是否需要調整（`pixels_per_meter` 不受影響）。這個修正
+    完成後，`YawAnchor` 依賴風險（下面）跟 information 單位失衡（下面）
+    這兩項待辦可能需要一併重新評估，不一定要照原樣單獨處理
   - [ ] posegraph.py: optimize_pose_graph 的 information 單位失衡 ——
     獨立於 YawAnchor 之外的架構問題（見上面「已知的限制」根因 2）：
     `information = coef * eye(6)` 對混合了平移（像素單位，量級

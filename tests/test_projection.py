@@ -12,6 +12,7 @@ from sea_mosaic.geo.projection import (
     R_EARTH_M,
     estimate_pixels_per_meter,
     geodetic_to_local_xy,
+    project_gimbal_yaw_degrees,
     project_gps_positions,
 )
 
@@ -148,3 +149,54 @@ def test_estimate_pixels_per_meter_scales_linearly_with_resolution():
     doubled = estimate_pixels_per_meter(altitude_m=99.978, dfov_deg=82.9, width_px=8112, height_px=6080)
 
     assert doubled == pytest.approx(2 * base, rel=1e-9)
+
+
+# --- project_gimbal_yaw_degrees --------------------------------------------------------
+# Real GimbalYawDegree values confirmed during the data/smoke/ diagnostic (CLAUDE.md's
+# 已知的限制 YawAnchor section): images 0352-0355 -> 39.0, -23.2, -54.6, -104.3.
+
+
+def test_project_gimbal_yaw_degrees_origin_is_zeroed():
+    gimbal_yaw = {0: 39.0, 1: -23.2, 2: -54.6, 3: -104.3}
+
+    projected = project_gimbal_yaw_degrees(gimbal_yaw, origin_index=0)
+
+    assert set(projected.keys()) == {0, 1, 2, 3}
+    assert projected[0] == pytest.approx(0.0, abs=1e-9)
+    assert projected[1] == pytest.approx(-62.2, abs=1e-6)
+    assert projected[2] == pytest.approx(-93.6, abs=1e-6)
+    assert projected[3] == pytest.approx(-143.3, abs=1e-6)
+
+
+def test_project_gimbal_yaw_degrees_explicit_non_zero_origin_index():
+    """Choosing image 1 as the origin instead of 0 must zero image 1 and move image 0
+    to the negated relative angle (sign-flip check, not just a single fixed origin)."""
+    gimbal_yaw = {0: 39.0, 1: -23.2}
+
+    projected = project_gimbal_yaw_degrees(gimbal_yaw, origin_index=1)
+
+    assert projected[1] == pytest.approx(0.0, abs=1e-9)
+    assert projected[0] == pytest.approx(62.2, abs=1e-6)
+
+
+def test_project_gimbal_yaw_degrees_default_origin_is_smallest_key():
+    """With origin_index=None, the function's own dependency-free default is the
+    smallest key present — mirrors project_gps_positions's default."""
+    gimbal_yaw = {5: 39.0, 2: -23.2}
+
+    projected = project_gimbal_yaw_degrees(gimbal_yaw)
+
+    assert projected[2] == pytest.approx(0.0, abs=1e-9)
+    assert projected[5] != pytest.approx(0.0, abs=1e-6)
+
+
+def test_project_gimbal_yaw_degrees_wraps_across_180_boundary():
+    """A raw difference that crosses the +-180 seam must wrap to the short way around,
+    not the literal signed difference — not exercised by data/smoke/'s real values,
+    which never cross this boundary."""
+    gimbal_yaw = {0: 170.0, 1: -170.0}
+
+    projected = project_gimbal_yaw_degrees(gimbal_yaw, origin_index=0)
+
+    # raw difference is -170 - 170 = -340, which must wrap to +20, not stay -340
+    assert projected[1] == pytest.approx(20.0, abs=1e-9)

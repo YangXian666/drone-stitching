@@ -19,11 +19,13 @@ def compose_global_transforms(
     *,
     pixels_per_meter: float,
     inlier_count_reference: float,
+    gimbal_yaw: dict[int, float] | None = None,
+    yaw_anchor_weight: float | None = None,
 ) -> GlobalTransforms:
-    """Compose global image-to-mosaic transforms via GPS-anchored pose-graph optimization.
+    """Compose global image-to-mosaic transforms via GPS/yaw-anchored pose-graph optimization.
 
     Delegates to posegraph.build_pose_graph (pair_results, gps_positions,
-    pixels_per_meter, inlier_count_reference) followed by
+    pixels_per_meter, inlier_count_reference, gimbal_yaw, yaw_anchor_weight) followed by
     posegraph.optimize_pose_graph (reference_index) — no pairwise-homography chaining
     happens here or in either delegate.
 
@@ -33,11 +35,17 @@ def compose_global_transforms(
     for a caller (e.g. pipeline.py) that wants a reasonable inlier_count_reference
     computed from its own pair_results rather than picking one blindly; computing and
     passing it is the caller's responsibility, not this function's.
+
+    gimbal_yaw and yaw_anchor_weight are optional and passed straight through to
+    build_pose_graph unchanged (see its docstring for the same "gimbal_yaw is optional,
+    but yaw_anchor_weight is required whenever gimbal_yaw is given" rule).
     """
     graph = build_pose_graph(
         pair_results,
         gps_positions,
         pixels_per_meter=pixels_per_meter,
         inlier_count_reference=inlier_count_reference,
+        gimbal_yaw=gimbal_yaw,
+        yaw_anchor_weight=yaw_anchor_weight,
     )
     return optimize_pose_graph(graph, reference_index=reference_index)

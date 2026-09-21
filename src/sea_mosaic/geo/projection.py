@@ -56,6 +56,33 @@ def project_gps_positions(
     }
 
 
+def project_gimbal_yaw_degrees(
+    gimbal_yaw_degrees: dict[int, float],
+    origin_index: int | None = None,
+) -> dict[int, float]:
+    """Project each image's absolute GimbalYawDegree (compass bearing, as returned by
+    io_utils.load_gimbal_yaw) onto a relative angle in degrees, wrapped to [-180, 180],
+    anchored at gimbal_yaw_degrees[origin_index].
+
+    Mirrors project_gps_positions's role for position: turns an absolute reading into a
+    locally-relative quantity good enough as a pose-graph anchor input, without any
+    knowledge of Sim(2)/homography conventions or the empirically-validated sign flip
+    (H_angle ~= -relative_yaw) — that conversion lives in posegraph.py, not here.
+
+    origin_index defaults to the smallest key present, matching project_gps_positions's
+    own dependency-free default for standalone/test use.
+    """
+    if origin_index is None:
+        origin_index = min(gimbal_yaw_degrees.keys())
+
+    origin_yaw_deg = gimbal_yaw_degrees[origin_index]
+
+    return {
+        image_index: (yaw_deg - origin_yaw_deg + 180.0) % 360.0 - 180.0
+        for image_index, yaw_deg in gimbal_yaw_degrees.items()
+    }
+
+
 def estimate_pixels_per_meter(
     altitude_m: float,
     dfov_deg: float,

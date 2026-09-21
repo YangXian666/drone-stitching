@@ -103,3 +103,74 @@ def test_compose_global_transforms_requires_pixels_per_meter_and_inlier_count_re
 
     with pytest.raises(TypeError):
         compose_global_transforms(pair_results, gps_positions, pixels_per_meter=1.0)  # type: ignore[call-arg]
+
+
+def test_compose_global_transforms_requires_yaw_anchor_weight_when_gimbal_yaw_given() -> None:
+    """compose_global_transforms must forward gimbal_yaw's required-weight check through
+    to build_pose_graph, not swallow or ignore it."""
+    pair_results = [_pair_result(0, 1)]
+    gps_positions = _gps_positions_m()
+
+    with pytest.raises(ValueError):
+        compose_global_transforms(
+            pair_results,
+            gps_positions,
+            reference_index=0,
+            pixels_per_meter=_PIXELS_PER_METER,
+            inlier_count_reference=_INLIER_COUNT_REFERENCE,
+            gimbal_yaw={0: 0.0, 1: -40.0},
+        )
+
+
+def test_compose_global_transforms_forwards_gimbal_yaw_to_build_pose_graph() -> None:
+    """Regression guard for a real oversight found in this project: compose_global_
+    transforms's signature was never updated to accept/forward gimbal_yaw and
+    yaw_anchor_weight when YawAnchor was added to build_pose_graph and
+    optimize_pose_graph, so YawAnchor was silently unusable through the public wrapper
+    (TypeError: unexpected keyword argument) despite both lower-level functions and
+    their own tests being complete and green.
+
+    This must actually move the result, not just avoid raising -- a corrupted-rotation
+    edge overridden by a yaw anchor, exercised through the full compose_global_transforms
+    path (mirrors tests/test_posegraph.py's equivalent hand-built-PoseGraph check, with
+    the same hand-verified expected angle: weight=5.0 against a 90deg-corrupted edge with
+    unit information converges to ~37deg, not exactly 40deg)."""
+    corrupted_homography = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])  # 90deg rotation
+    pair_result = PairResult(
+        src_index=0,
+        dst_index=1,
+        src_points=np.zeros((10, 2)),
+        dst_points=np.zeros((10, 2)),
+        inlier_mask=np.ones(10, dtype=bool),
+        homography=corrupted_homography,
+    )
+    true_rotation_deg = 40.0
+    gimbal_yaw = {0: 0.0, 1: true_rotation_deg}  # relative_yaw s.t. theta_target = 40deg directly
+
+    result_without = compose_global_transforms(
+        [pair_result],
+        gps_positions=None,
+        reference_index=0,
+        pixels_per_meter=_PIXELS_PER_METER,
+        inlier_count_reference=10.0,
+    )
+    result_with = compose_global_transforms(
+        [pair_result],
+        gps_positions=None,
+        reference_index=0,
+        pixels_per_meter=_PIXELS_PER_METER,
+        inlier_count_reference=10.0,
+        gimbal_yaw=gimbal_yaw,
+        yaw_anchor_weight=5.0,
+    )
+
+    def _angle_deg(result) -> float:
+        pose = result.transforms[1]
+        return float(np.degrees(np.arctan2(pose[1, 0], pose[0, 0])))
+
+    angle_without = _angle_deg(result_without)
+    angle_with = _angle_deg(result_with)
+
+    assert abs(angle_without - (-90.0)) < 1e-3  # unrescued baseline, same as the posegraph-level test
+    assert abs(angle_with - true_rotation_deg) < 10.0
+    assert abs(angle_with - true_rotation_deg) < 0.3 * abs(angle_without - true_rotation_deg)
