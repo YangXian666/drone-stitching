@@ -255,8 +255,19 @@ def optimize_pose_graph(graph: PoseGraph, reference_index: int = 0) -> GlobalTra
         poses = poses_from_flat(flat_params)
         residual_terms = []
         for edge in graph.edges:
-            predicted = np.linalg.inv(poses[edge.dst_index]) @ poses[edge.src_index]
-            diff = (predicted - edge.relative_pose)[:2, :].flatten()
+            # Derived from relative_pose ~= inv(pose_dst) @ pose_src by left-multiplying
+            # both sides by pose_dst: pose_src ~= pose_dst @ relative_pose. Never inverts
+            # a decision variable (R_dst) -- only relative_pose's own fixed R_rel/t_rel
+            # are read from data. This avoids the classic Sim(2) pose-graph coupling trap
+            # where inverting pose_dst introduces a 1/scale^2 term that lets a GPS
+            # anchor's translation pull leak into the rotation/scale subspace (see
+            # CLAUDE.md's 已知的限制 for the full derivation and diagnosis).
+            R_dst = poses[edge.dst_index][:2, :2]
+            t_dst = poses[edge.dst_index][:2, 2]
+            R_rel = edge.relative_pose[:2, :2]
+            t_rel = edge.relative_pose[:2, 2]
+            predicted_src = np.hstack([R_dst @ R_rel, (R_dst @ t_rel + t_dst).reshape(2, 1)])
+            diff = (predicted_src - poses[edge.src_index][:2, :]).flatten()
             residual_terms.append(edge.information @ diff)
         for anchor in graph.anchors:
             position_error = poses[anchor.image_index][:2, 2] - anchor.position_xy[:2]
