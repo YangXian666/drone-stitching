@@ -11,6 +11,7 @@ import pytest
 from sea_mosaic.io_utils import (
     _exif_dms_to_decimal_degrees,
     _xmp_signed_decimal,
+    load_gimbal_yaw,
     load_gps_position,
 )
 
@@ -109,5 +110,30 @@ def test_load_gps_position_exif_missing_falls_back_to_xmp():
 
 def test_load_gps_position_no_gps_returns_none():
     result = load_gps_position(FIXTURES / "no_gps.jpg")
+
+    assert result is None
+
+
+# --- load_gimbal_yaw: XMP-only (no EXIF equivalent for gimbal attitude) ----------------
+
+
+def test_load_gimbal_yaw_real_file():
+    result = load_gimbal_yaw(FIXTURES / "DJI_20230127131426_0352_W.JPG")
+
+    assert result == pytest.approx(39.00, abs=1e-6)
+
+
+def test_load_gimbal_yaw_second_real_file_is_negative():
+    """Cross-check a second real file with a different sign, not just a single
+    hardcoded positive value."""
+    result = load_gimbal_yaw(FIXTURES / "DJI_20230127131429_0353_W.JPG")
+
+    assert result == pytest.approx(-23.20, abs=1e-6)
+
+
+def test_load_gimbal_yaw_no_xmp_returns_none():
+    """no_gps.jpg has no XMP packet at all (not just a missing GPS fix), so there is no
+    GimbalYawDegree attribute to read either."""
+    result = load_gimbal_yaw(FIXTURES / "no_gps.jpg")
 
     assert result is None

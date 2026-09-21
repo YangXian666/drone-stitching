@@ -136,12 +136,26 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     inlier_count 的 median），取代先前用單一邊 `inlier_count=40` 當
     reference 的版本（40 是離群值、不具代表性，已被這次完整 9 邊驗證
     推翻）。`pixels_per_meter≈28.703` 的換算方式維持不變。
+- **`io_utils.py` 的 `load_image`/`load_images` 仍是 `...` 空殼**（沒有真的用
+  PIL/cv2 讀圖、也沒有測試覆蓋），已經在兩個不同任務裡各撞到一次：
+  第一次是 SIFT `match_pair` 對照實驗（0352 vs 0353 inlier_ratio 診斷），
+  第二次是 `compose_global_transforms` 全流程診斷（`data/smoke/` 10 張真實
+  影像）。兩次都是繞過（在診斷腳本裡直接用 `cv2.imread` 讀圖，不動
+  `io_utils.py`），因為色彩空間、失敗處理等設計決定不該在一次性診斷腳本
+  裡定案。這代表這不是單次巧合，是一個會反覆卡住多個任務的真實缺口——
+  `warp.py`/`blend.py` 大機率也需要讀取真實影像像素，很可能會第三次撞到。
+  已在下面「目前狀態」把 `load_image`/`load_images` 明確排入待辦，排在
+  `warp.py` 之前。
 
 ## 目前狀態
 - [x] SSH + VS Code Remote-SSH + Claude Code CLI 環境
 - [x] 專案骨架
 - [x] metrics.py + unit tests
 - [x] EXIF/XMP 解析 (GPS 座標讀取 + 局部平面投影，21/21 tests passing)
+- [x] io_utils.py: load_gimbal_yaw（XMP-only，無 EXIF 對應項，63/63 tests
+  passing）—— 為了支撐 YawAnchor 設計的第一步（見下面 feature-based
+  pipeline 清單），YawAnchor 本身（posegraph.py dataclass 設計、weight
+  量級驗證、CLAUDE.md 完整記錄根因）仍待完成，見下方待辦
 - [ ] direct georeferencing (geo/camera.py, geo/direct.py) 仍暫緩，見「已知的暫緩事項」
 - [ ] feature-based pipeline
   - [x] estimate.py: sequential_pairs + match_pair/estimate_all_pairs
@@ -150,6 +164,25 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     45/45 tests passing，另用不對稱合成資料驗證過 node index 對應正確)
   - [x] posegraph.py: build_pose_graph (從真實 PairResult + GPS 座標建圖)
   - [x] compose.py: compose_global_transforms
+  - [x] io_utils.py: load_gimbal_yaw（XMP-only，63/63 tests passing）
+  - [ ] posegraph.py: YawAnchor —— 用真實 data/smoke/ 資料診斷發現
+    compose_global_transforms 目前有嚴重的旋轉/縮放退化 bug（node scale
+    崩潰到 0.17～0.24、旋轉不連續甚至變號），根因是 GPS anchor 只約束
+    平移、完全不約束旋轉/縮放，低 inlier 邊的 information 又被 median
+    正規化壓到接近 0，導致這些 node 的旋轉/縮放實質上沒有任何訊號在管。
+    已用 GimbalYawDegree 驗證出可行的修法方向（符號翻轉關係
+    `H_angle ≈ -relative_yaw` 在 9 條邊上驗證通過，residual 落在
+    -1.52°~+0.67°，且低 inlier 的邊旋轉分量本身其實可信，只是被權重
+    壓到失聲），必須在 warp.py 之前修好，否則會在 warp 階段顯形成扭曲
+    影像。剩餘步驟：(1) posegraph.py 新增 YawAnchor dataclass 設計定案；
+    (2) 用真實數字驗證 yaw anchor weight 跟 position anchor weight=1.0
+    的量級對比（同 pixels_per_meter/inlier_count_reference 的驗證方式，
+    不可憑感覺選係數）；(3) 在 CLAUDE.md「已知的限制」完整記錄這次發現
+    的根因、機制、與符號翻轉驗證的樣本限制附帶條件（僅 9 條邊、單一飛行
+    高度、僅 3 段實際偏航變化，尚未涵蓋轉彎/爬升等更複雜飛行動作）
+  - [ ] io_utils.py: load_image/load_images 正式實作（含測試）—— 目前是
+    `...` 空殼，已反覆在多個診斷任務裡被繞過（見上面「已知的限制」），
+    排在 warp.py 之前，因為 warp.py 大機率也依賴它
   - [ ] warp.py
   - [ ] blend.py
   - [ ] pipeline.py: 串接 estimate → compose → warp → blend

@@ -118,3 +118,14 @@ def load_gps_position(path: Path) -> np.ndarray | None:
         rel_alt = _xmp_signed_decimal(xmp_fields["RelativeAltitude"])
 
     return np.array([lat, lon, abs_alt, rel_alt], dtype=np.float64)
+
+
+def load_gimbal_yaw(path: Path) -> float | None:
+    """Extract GimbalYawDegree from the embedded XMP drone-dji metadata; None if the XMP
+    packet has no such attribute at all (e.g. no XMP packet, or one without gimbal
+    fields). DJI-specific XMP field with no EXIF equivalent, unlike load_gps_position's
+    EXIF-primary/XMP-fallback GPS fix — there is no second source to fall back to here."""
+    xmp_fields = _read_xmp_drone_dji_fields(path)
+    if "GimbalYawDegree" not in xmp_fields:
+        return None
+    return _xmp_signed_decimal(xmp_fields["GimbalYawDegree"])
