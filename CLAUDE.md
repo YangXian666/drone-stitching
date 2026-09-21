@@ -1,3 +1,5 @@
+
+
 # Drone Sea-Surface Mosaic Pipeline
 
 無人機垂直下視海面影像的拼接 pipeline。最終產出 georeferenced mosaic
@@ -648,7 +650,20 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   - [ ] io_utils.py: load_image/load_images 正式實作（含測試）—— 目前是
     `...` 空殼，已反覆在多個診斷任務裡被繞過（見上面「已知的限制」），
     排在 warp.py 之前，因為 warp.py 大機率也依賴它
-  - [ ] warp.py
-  - [ ] blend.py
+  - [x] warp.py: compute_canvas_size / warp_images —— 12/12 新測試通過
+    （`tests/test_warp.py`，全部手構造合成資料，不需要真的讀圖，沒有碰
+    `load_image`/`load_images` 空殼），100/100 全專案測試綠燈。刻意分層
+    驗證：只測「給定的 3x3 transform 有沒有被正確套用」（含一組乾淨的
+    合成旋轉案例），不測「`compose_global_transforms` 在真實資料上的
+    旋轉準不準」——後者是上面「已知的暫緩事項」記錄的已知限制，這輪
+    不處理。`camera_intrinsics`/`camera_poses` 仍是保留參數，未使用
+  - [x] blend.py: blend_images —— distance-transform feathering（
+    `cv2.distanceTransform(mask, DIST_L2, DIST_MASK_PRECISE)` 算每張
+    影像的原始權重，正規化成 `alpha_i`，回傳的 seam mask 是連續值
+    float32 [0,1]，不是二值分割）。9/9 新測試通過（`tests/test_blend.py`，
+    全部手構造合成資料），109/109 全專案測試綠燈。跟 warp.py 同樣的
+    分層驗證原則：合成資料驗證 blending 邏輯本身（含用鏡像對稱幾何
+    精確驗證 50/50、用推導出的 1/17 門檻驗證接縫連續性，不是猜的
+    數字），不追求在真實資料（已知旋轉不可靠）上產出視覺完美結果
   - [ ] pipeline.py: 串接 estimate → compose → warp → blend
 - [ ] FastAPI
