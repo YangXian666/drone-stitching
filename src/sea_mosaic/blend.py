@@ -29,10 +29,18 @@ def blend_images(
     canvas_size = warped_images.canvas_size
     indices = sorted(warped_images.images)
 
-    weights = {
-        index: cv2.distanceTransform(warped_masks.masks[index], cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        for index in indices
-    }
+    weights = {}
+    for index in indices:
+        mask = warped_masks.masks[index]
+        raw_weight = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+        # cv2.distanceTransform has no zero pixel to measure to when a mask has no
+        # black border at all (its nonzero region exactly fills the array) -- it then
+        # returns an overflow-style sentinel (~1.8e19), not a real distance. Clip to the
+        # mask's own diagonal: any genuine distance-to-boundary value is bounded by
+        # roughly half the shorter side, so the full diagonal is a safe, always-larger
+        # cap that never affects a real (bordered) mask's values, only this sentinel.
+        max_possible_distance = float(np.hypot(*mask.shape))
+        weights[index] = np.minimum(raw_weight, max_possible_distance)
 
     total_weight = np.zeros(canvas_size, dtype=np.float64)
     for index in indices:

@@ -462,6 +462,45 @@ def test_optimize_pose_graph_empty_yaw_anchors_behaves_exactly_as_before() -> No
     assert abs(errors[4] - errors[1]) < 1.0
 
 
+def test_optimize_pose_graph_reference_only_graph_converges_without_crashing() -> None:
+    """Regression guard: a graph containing ONLY the reference node (no other nodes,
+    no edges, no anchors at all) must not crash. Found while implementing
+    pipeline.py's run_pipeline: `optimizable_indices` is empty in this case, and
+    `np.concatenate([])` (called unconditionally, before the "nothing to optimize"
+    branch could return early) raised `ValueError: need at least one array to
+    concatenate` -- a real, previously-uncaught bug, not a run_pipeline mistake, since
+    none of this file's other tests ever built a graph with only one node total."""
+    graph = PoseGraph(
+        nodes=[PoseGraphNode(image_index=0, initial_pose=_similarity_matrix(1.0, 0.0, 0.0, 0.0), gps_anchor=None)],
+        edges=[],
+        anchors=[],
+    )
+
+    result = optimize_pose_graph(graph, reference_index=0)
+
+    assert result.optimization_status == "converged"
+    assert np.array_equal(result.transforms[0], _similarity_matrix(1.0, 0.0, 0.0, 0.0))
+    assert np.isnan(result.residual_error)  # no edges, no anchors -> nothing to measure
+
+
+def test_optimize_pose_graph_reference_only_graph_with_anchor_converges_with_zero_residual() -> None:
+    """Same single-node scenario, but the reference itself carries a GPSAnchor whose
+    position exactly matches its own initial_pose translation (mirrors run_pipeline's
+    synthetic default-anchor-for-the-reference pattern) -- residual_error must be a
+    finite ~0, not NaN or a crash."""
+    anchor = GPSAnchor(image_index=0, position_xy=np.array([0.0, 0.0]), weight=1.0)
+    graph = PoseGraph(
+        nodes=[PoseGraphNode(image_index=0, initial_pose=_similarity_matrix(1.0, 0.0, 0.0, 0.0), gps_anchor=anchor)],
+        edges=[],
+        anchors=[anchor],
+    )
+
+    result = optimize_pose_graph(graph, reference_index=0)
+
+    assert result.optimization_status == "converged"
+    assert result.residual_error == pytest.approx(0.0, abs=1e-9)
+
+
 @pytest.mark.parametrize("theta_target_deg", [30.0, -47.0])
 def test_optimize_pose_graph_yaw_anchor_pulls_isolated_node_rotation_to_target(theta_target_deg: float) -> None:
     """No edges, no GPS anchors at all — the only residual term touching node 1 is its

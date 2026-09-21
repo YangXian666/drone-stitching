@@ -243,6 +243,47 @@ def test_blend_images_alpha_transition_step_bounded_by_derived_threshold():
     assert np.max(steps) <= derived_bound + 1e-6
 
 
+def test_blend_images_no_black_border_mask_does_not_overwhelm_other_images():
+    """Regression test for a real (not hypothetical) blend_images bug found while
+    designing pipeline.py's per-image warp-failure isolation: when an image's mask has
+    NO black border at all (its nonzero region exactly fills the mask array -- e.g. the
+    lone surviving image after other images get isolated out upstream, so the shared
+    canvas ends up exactly its own size), cv2.distanceTransform has no zero pixel to
+    measure to and returns an overflow-style sentinel (~1.8e19) instead of a real
+    distance. Without clipping, this sentinel would swamp any other image's normal
+    (bounded) weight by ~16 orders of magnitude, forcing alpha toward 1.0/0.0 in any
+    overlap regardless of actual geometry -- not a crash, but silently wrong blending
+    that no earlier test caught (every other test's masks already had real margins).
+
+    Verified directly (not guessed): with the diagonal-length clip, image A's borderless
+    canvas-filling mask and image B's normal 20x20 bordered mask blend to exactly
+    alpha_A=0.8333 (=50/60, clip=diagonal of the 30x40 canvas) and alpha_B=0.1667
+    (=10/60, B's own real distance-to-edge at its center) at B's footprint center --
+    B keeps a real, non-negligible say, not the near-zero it would get unclipped."""
+    canvas_size = (30, 40)
+    mask_a = np.full(canvas_size, 255, dtype=np.uint8)  # no black border anywhere
+    mask_b = np.zeros(canvas_size, dtype=np.uint8)
+    mask_b[5:25, 10:30] = 255  # a normal, bordered 20x20 footprint
+
+    color_a = np.array([50, 50, 50], dtype=np.uint8)
+    color_b = np.array([200, 200, 200], dtype=np.uint8)
+    image_a = np.tile(color_a, (canvas_size[0], canvas_size[1], 1))
+    image_b = np.zeros((canvas_size[0], canvas_size[1], 3), dtype=np.uint8)
+    image_b[5:25, 10:30] = color_b
+
+    warped_images = WarpedImages(images={0: image_a, 1: image_b}, canvas_size=canvas_size)
+    warped_masks = WarpedMasks(masks={0: mask_a, 1: mask_b}, canvas_size=canvas_size)
+
+    _mosaic, seam_masks = blend_images(warped_images, warped_masks)
+
+    b_center = (15, 20)
+    assert seam_masks[0][b_center] == pytest.approx(50.0 / 60.0, abs=1e-4)
+    assert seam_masks[1][b_center] == pytest.approx(10.0 / 60.0, abs=1e-4)
+    # the key regression guard: B keeps a real say, nowhere near the ~0 it would get
+    # from an unclipped ~1.8e19-vs-10 comparison
+    assert seam_masks[1][b_center] > 0.1
+
+
 def test_blend_images_alpha_monotonically_decreases_moving_away_from_source_image():
     warped_images, warped_masks = _asymmetric_overlap_scenario()
 

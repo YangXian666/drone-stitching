@@ -548,6 +548,43 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     得多——不是「先解一次最佳化、再解第二次」，是「旋轉直接用感測器
     讀數、完全不最佳化，只對平移做最佳化」。**這個方向目前只是構想，
     還沒有評估範圍/可行性，是下一步要做的事**。
+- **`run_pipeline` 端到端跑完真實 `data/smoke/` 10 張影像後，發現目前整套
+  `pipeline_status`/`successful_image_count` 分類規則，加上 task2.md
+  定義的 `distortion` metric，對「pose graph 收斂後產生的 scale 崩潰」
+  這類幾何異常完全沒有偵測能力——這比「按設計運作」更值得明確記錄，
+  不只是順便一提**：
+  - **分類規則的盲點**：方案 B 的 `_MIN_INLIERS_FOR_DETERMINED_
+    HOMOGRAPHY=4` 門檻只判斷「有沒有足夠資料算出 homography」，
+    不判斷「pose graph 最佳化後的幾何合不合理」——這是常數旁邊的
+    docstring 本來就講清楚的界線，不是遺漏。真實資料上，node1/2/3
+    的 `inlier_count`（40、40、717）都遠高於門檻 4，所以這次
+    `run_pipeline` 端到端跑出 `pipeline_status=success`、全部 10 張
+    都算成功，**即使 mosaic 裡確實包含已知的嚴重幾何扭曲**（node1
+    scale=0.169、node2 scale=0.244，見上面 Check A/B/C 那一輪診斷）。
+  - **`distortion` metric 的盲點**：`compute_distortion` 量的是局部
+    Jacobian 的各向異性（`abs(log(sigma1/sigma2))`）。我們的
+    `GlobalTransforms` 永遠是 Sim(2) 相似變換（均勻縮放+旋轉，沒有
+    shear），這種變換的 Jacobian **恆有 `sigma1==sigma2`**，不管
+    縮放係數本身是 0.169 還是 5.0——「各方向縮放一致」跟「縮放係數
+    本身合不合理」是兩個獨立的性質，`distortion` 只檢查前者。這是
+    這個 metric 定義本身的性質，不是 bug，但**必須記錄清楚原因，
+    避免之後有人誤以為 `distortion≈0` 就代表幾何沒問題**——這次真實
+    資料跑出 `distortion≈5e-15`（幾乎精確 0），但 node1/2/3 的 scale
+    崩潰完全沒有被這個數字反映出來。
+  - **結論：`metrics_df` 目前沒有任何一個欄位能反映「這個 node 的
+    scale 崩潰了」這件事**——`reprojection_error_px`/`inlier_ratio`/
+    `inlier_count` 只看 feature matching 品質，`distortion` 只看
+    局部各向異性，`pipeline_status`/`successful_image_count` 只看
+    「有沒有數據可以算」。三層規則各自的設計都合理，但疊起來就是
+    對這一類問題視而不見。
+- **新增獨立待辦（見下面「目前狀態」）：需要一個新的品質指標或分類
+  規則層級，檢查 `GlobalTransforms.transforms` 裡每個 node 的
+  `sqrt(a²+b²)`（scale）是否落在合理範圍**，而不是只看
+  `inlier_count` 夠不夠或 Jacobian 各向異性。這個待辦排在「10 月
+  重新評估旋轉退化問題」旁邊，兩者密切相關——等旋轉/scale 問題真正
+  修好之後，這個檢測層級可以順便當驗證修復是否生效的工具（就像
+  `blend.py` 那次的霧化色塊一樣，是一個額外的診斷手段，不只是防禦
+  機制）。
 - **`io_utils.py` 的 `load_image`/`load_images` 仍是 `...` 空殼**（沒有真的用
   PIL/cv2 讀圖、也沒有測試覆蓋），已經在兩個不同任務裡各撞到一次：
   第一次是 SIFT `match_pair` 對照實驗（0352 vs 0353 inlier_ratio 診斷），
@@ -628,6 +665,19 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     診斷（見上面「已知的限制」Check A）之後再決定。`warp.py`/`blend.py`
     開發時要記得目前 `compose_global_transforms` 的旋轉輸出不可靠，
     下游先只用平移座標做粗略排列驗證，不依賴精確旋轉結果
+  - [ ] metrics.py/pipeline.py: 新增偵測「node scale 崩潰」的品質指標
+    或分類規則層級——**跟上面「旋轉退化（暫緩）」密切相關,排在它
+    旁邊,但這次不處理**。見上面「已知的限制」：目前 `pipeline_status`/
+    `successful_image_count`（方案 B 的 inlier 門檻）跟 `distortion`
+    metric（Sim(2) 相似變換的 Jacobian 各向異性恆為 1，量不到均勻縮放
+    崩潰）加起來，對「node1 scale=0.169 這種嚴重幾何扭曲」完全沒有
+    偵測能力——真實資料端到端跑出 `pipeline_status=success`、
+    `distortion≈5e-15`，但 mosaic 裡確實有已知的嚴重扭曲,`metrics_df`
+    没有任何欄位反映這件事。具體構想：檢查
+    `GlobalTransforms.transforms` 裡每個 node 的 `sqrt(a²+b²)` 是否
+    落在合理範圍（例如遠離 1.0 就標記）。等旋轉/scale 問題修好後，
+    這個檢測層級可以順便當驗證修復是否生效的診斷工具，不只是防禦
+    機制
   - [ ] posegraph.py: optimize_pose_graph 的 information 單位失衡 ——
     獨立於 YawAnchor 之外的架構問題（見上面「已知的限制」根因 2）：
     `information = coef * eye(6)` 對混合了平移（像素單位，量級
@@ -664,6 +714,86 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     全部手構造合成資料），109/109 全專案測試綠燈。跟 warp.py 同樣的
     分層驗證原則：合成資料驗證 blending 邏輯本身（含用鏡像對稱幾何
     精確驗證 50/50、用推導出的 1/17 門檻驗證接縫連續性，不是猜的
-    數字），不追求在真實資料（已知旋轉不可靠）上產出視覺完美結果
-  - [ ] pipeline.py: 串接 estimate → compose → warp → blend
+    數字），不追求在真實資料（已知旋轉不可靠）上產出視覺完美結果。
+    **後續在規劃 `pipeline.py` 的錯誤隔離機制時發現並修正了一個
+    `blend_images` 自己的真實邏輯漏洞**（不是資料品質問題，跟 compose
+    的旋轉退化不是同一類、不能歸咎給這批替代資料）：`cv2.distanceTransform`
+    對「完全沒有黑邊」的 mask（非零區域剛好佔滿整個陣列）沒有零像素可以
+    量距離，會回傳一個溢位式的哨兵值（實測 ≈1.8e19），比正常影像的權重
+    大 16 個數量級，會讓那張影像的 alpha 壓倒性主導、蓋掉所有真實幾何
+    重疊資訊。這個情境本來就可能發生（例如只剩一張影像存活時，畫布剛好
+    等於它自己的尺寸），`pipeline.py` 規劃的「隔離退化影像」機制還會
+    提高這個情境出現的機率——**修法**：把 `distanceTransform` 的輸出
+    clip 到該 mask 自己的對角線長度（`np.hypot(*mask.shape)`）——真實
+    （有黑邊）mask 算出來的距離值最多在自身較短邊一半左右，對角線是
+    一個寬鬆但有物理意義的安全上界，不會誤裁到任何真實數值，只會壓制
+    這個哨兵值。已補 1 條回歸測試
+    （`test_blend_images_no_black_border_mask_does_not_overwhelm_other_images`，
+    用實測算出的精確數字 0.8333/0.1667 鎖定，不是猜的），110/110 全專案
+    測試綠燈。
+  - [x] pipeline.py: 串接 estimate → compose → warp → blend → evaluate metrics。
+    **`run_pipeline` 的職責邊界已定案：收已讀好的 `images: dict[int,
+    np.ndarray]`，不涉及檔案 IO**（原本骨架簽名是 `image_paths:
+    list[Path]`，隱含要呼叫 `load_image`/`load_images`；已改成
+    `images`，理由是「檔案讀取的色彩空間/批次失敗策略」跟「pipeline
+    分類規則」是完全不同層次的問題，混在一起做出錯時無法定位，跟
+    fake Matcher 測 RANSAC、合成資料測 warp 幾何是同一個分層原則）。
+    `PipelineConfig` 相應擴充（`altitude_m`/`dfov_deg` 必填無預設值，
+    直接在 `PipelineConfig()` 建構時就報錯，不用等 `run_pipeline` 跑到
+    一半才發現缺東西；`gps_positions`/`gimbal_yaw`/`yaw_anchor_weight`/
+    `pairs`/`loops` 維持可選、預設 `None`，跟 `compose_global_transforms`/
+    `build_pose_graph` 自己的可選性一致）——`run_pipeline` 簽名統一走
+    `config: PipelineConfig`，不跟散裝關鍵字參數混用兩種風格。14/14 新
+    測試通過（`tests/test_pipeline.py`，用假 Matcher/`mock.patch`
+    隔離,不需要真的 SIFT），126/126 全專案測試綠燈。
+    - **成功判斷規則（方案 B）落地**：`i` 算成功 ⟺ `i` 在
+      `global_transforms.transforms` 裡、warp 後 mask 非全零、且
+      （`i==reference_index` 或 `i` 有 GPS anchor 或 `i` 至少一條連到
+      它的邊 `inlier_count>=4`）。`_MIN_INLIERS_FOR_DETERMINED_
+      HOMOGRAPHY=4` 的理由明確記在常數旁：4 點是 homography 8 個自由度
+      在數學上的最低可解點數，**不代表「≥4 就可信」**（Check A 已經
+      證明 inlier=717 這種遠高於門檻的邊一樣可能被複合放大成崩潰結果，
+      「解得出來」跟「可信」是兩個不同的主張）。
+    - **estimate 階段的錯誤隔離**：`run_pipeline` 自己逐 pair 呼叫
+      `match_pair`、用 try/except 隔離（不改 `estimate.py`/
+      `estimate_all_pairs` 本身的合約），`run_pipeline` 是系統邊界，
+      底層函式維持單純。
+    - **warp 階段的隔離改成事前過濾，不是 try/except**：實測
+      `cv2.warpPerspective` 對任何病態矩陣（scale=0、NaN、inf）都
+      **不拋例外**，只會靜默輸出全黑影像；但
+      `compute_canvas_size` 對 NaN/inf 會拋 `ValueError`，而且如果
+      canvas_size 是拿全部影像的 transform 一次算的，一張影像的
+      NaN 會**連累其他健康影像的計算**。修法：在算 canvas_size 之前
+      先用 `np.all(np.isfinite(transform))` 過濾掉非有限的
+      transform，有限但退化（scale=0）的則沿用「warp 後 mask 非全零
+      才算成功」的既有規則自然接住，不需要新機制。
+    - **`compose_global_transforms` 的 `optimization_status !=
+      "converged"`（含 `"not_converged"` 跟 `"failed"`）視同全部
+      影像失敗**，完全不呼叫 `warp_images`/`blend_images`——不信任一個
+      最佳化器自己都不認為收斂的結果。
+    - **`pixels_per_meter`/`inlier_count_reference` 完全由
+      `run_pipeline` 內部算出**（前者用 reference image 自己的
+      `shape` + `config.altitude_m`/`dfov_deg`；後者用這次真正跑出來
+      的 `pair_results`），不是呼叫端傳入的參數。
+  - **實作過程中發現並修正了一個 `posegraph.py` 自己的真實 bug（不是
+    `run_pipeline` 寫錯，是既有、已測試模組裡先前沒被抓到的邊界情況）**：
+    `optimize_pose_graph` 的 `initial_params = np.concatenate([...])`
+    是無條件執行的，執行順序在「圖裡沒有任何可最佳化 node（只有
+    reference 自己）」這個分支的判斷之前——當這個情況真的發生時（單張
+    影像輸入、或所有邊都失敗只剩 reference），`np.concatenate([])`
+    直接拋 `ValueError`，那個本來就是為了處理這個情況而寫的分支永遠
+    到不了。既有 27 條 `posegraph.py` 測試從來沒有測過「圖裡只有一個
+    node」這個案例，所以沒被抓到。**修法**：把這行包進
+    `if optimizable_indices: ... else: initial_params = np.zeros(0)`。
+    已補 2 條回歸測試進 `tests/test_posegraph.py`（單一 reference
+    node、無/有 anchor 兩種情況），29/29 該檔案測試綠燈，跟
+    `blend_images` 那次一樣的原則：修正跟回歸測試進它自己的測試套件，
+    不是靠上層 `run_pipeline` 繞過去。
+  - [ ] pipeline.py: `run_pipeline` 要不要自動呼叫 `metrics.py` 已有的
+    `save_metrics_txt`（存 `metrics.txt` 到跟 mosaic 圖片同目錄，per
+    docs/task2.md §9）——**這輪刻意不處理，留給下一輪獨立討論**：
+    要不要輸出、輸出到哪個路徑、跟 mosaic 圖片存在同一目錄的規則
+    怎麼定、圖片本身要不要也是 `run_pipeline` 自動寫檔（目前
+    `run_pipeline` 只回傳 `(mosaic, metrics_df)`，沒有寫任何檔案）,
+    這些是新的、獨立的設計決定,不屬於「串接四段管線」這輪的範圍。
 - [ ] FastAPI

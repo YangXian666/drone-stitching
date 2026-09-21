@@ -240,9 +240,16 @@ def optimize_pose_graph(graph: PoseGraph, reference_index: int = 0) -> GlobalTra
     # must be identical every time it's derived from node_by_index.
     optimizable_indices = sorted(index for index in node_by_index if index != reference_index)
 
-    initial_params = np.concatenate(
-        [_pose_to_params(node_by_index[index].initial_pose) for index in optimizable_indices]
-    )
+    # np.concatenate needs at least one array; when optimizable_indices is empty (the
+    # graph has only the reference node), there is nothing to concatenate at all -- the
+    # "nothing to optimize" branch further below handles that case, but only if this
+    # line doesn't raise first trying to get there.
+    if optimizable_indices:
+        initial_params = np.concatenate(
+            [_pose_to_params(node_by_index[index].initial_pose) for index in optimizable_indices]
+        )
+    else:
+        initial_params = np.zeros(0)
 
     def poses_from_flat(flat_params: np.ndarray) -> dict[int, np.ndarray]:
         poses = {reference_index: reference_pose}
