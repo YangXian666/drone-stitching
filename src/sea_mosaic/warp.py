@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import cv2
 import numpy as np
 
@@ -88,3 +90,47 @@ def warp_images(
         WarpedImages(images=warped_images, canvas_size=canvas_size),
         WarpedMasks(masks=warped_masks, canvas_size=canvas_size),
     )
+
+
+def warp_images_streaming(
+    images: dict[int, np.ndarray],
+    global_transforms: GlobalTransforms,
+    canvas_size: tuple[int, int],
+) -> Iterator[tuple[int, np.ndarray, np.ndarray]]:
+    """Per-image generator form of warp_images: yields (index, warped_image, warped_mask)
+    one at a time instead of eagerly materializing all N canvas-sized arrays into a dict
+    before returning. Exists so a caller (blend_images_streaming, driven by pipeline.py)
+    can fold each image's contribution into a running accumulator and let it be garbage
+    collected before the next image is warped, keeping peak memory at O(canvas_size)
+    instead of warp_images's O(N * canvas_size) -- see CLAUDE.md's streaming-accumulator
+    backlog item for the full memory diagnosis this exists to address.
+
+    canvas_size is the caller's responsibility (computed once via compute_canvas_size),
+    not recomputed here, matching warp_images's own canvas_size -- keeping
+    compute_canvas_size's single responsibility rather than adding a canvas-size-carrying
+    iterator class. min_xy (needed for the per-image origin offset, not derivable from
+    canvas_size's height/width alone) is still recomputed here via _mosaic_bounds -- a
+    cheap O(N) corner-projection, not a canvas-sized allocation, so this redundancy with
+    the caller's own compute_canvas_size call does not reintroduce the O(N * canvas_size)
+    cost this function exists to avoid.
+
+    Nothing in this function's body runs until the first item is requested (ordinary
+    Python generator-function semantics: calling this only constructs a generator object).
+    Each loop iteration reassigns warped_image/warped_mask to fresh arrays and yields
+    immediately -- no accumulation of previously-yielded arrays anywhere in this function,
+    so once a caller drops its own reference to a yielded pair and the generator has moved
+    on to the next iteration, nothing here keeps it alive.
+    """
+    image_shapes = {index: image.shape[:2] for index, image in images.items()}
+    min_xy, _max_xy = _mosaic_bounds(image_shapes, global_transforms)
+    dsize = (canvas_size[1], canvas_size[0])  # cv2 wants (width, height)
+    origin_offset = np.array(
+        [[1.0, 0.0, -min_xy[0]], [0.0, 1.0, -min_xy[1]], [0.0, 0.0, 1.0]]
+    )
+
+    for index, image in images.items():
+        transform = origin_offset @ global_transforms.transforms[index]
+        warped_image = cv2.warpPerspective(image, transform, dsize)
+        full_mask = np.full(image.shape[:2], 255, dtype=np.uint8)
+        warped_mask = cv2.warpPerspective(full_mask, transform, dsize)
+        yield index, warped_image, warped_mask

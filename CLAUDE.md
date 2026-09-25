@@ -14,6 +14,15 @@
   - 用法：CUDA_VISIBLE_DEVICES=0 python3 your_script.py
 - 這是共用的容器化平台（Kubernetes pod），沒有 sudo、沒有 apt 安裝權限、
   沒有 Docker（也沒有 podman/apptainer 替代品）
+- **這個 pod 的真實記憶體上限是 60GB（cgroup `/sys/fs/cgroup/memory.max`），
+  不是 `free -h` 顯示的主機總量（314GB）**——`free -h` 看到的是整台共用
+  主機的記憶體，跟這個 pod 實際能用的量無關，會嚴重誤導記憶體相關的判斷。
+  任何記憶體診斷或容量規劃都要看 `/sys/fs/cgroup/memory.current`（目前
+  用量）對照 `/sys/fs/cgroup/memory.max`（上限，這個 pod 是 60GB），不要
+  再看 `free -h`。已經用一次真實診斷（`warp_images`/`blend_images` 對
+  20~50 張真實影像的記憶體用量，見下面「已知的限制」）驗證過這個落差：
+  `free -h` 顯示「還有 266Gi 可用」的當下，這個 pod 實際離 60GB 的 cgroup
+  上限只剩不到 10GB
 - 依賴一律用 poetry add，不要用 pip install，不要用 --break-system-packages
 - Dockerfile / compose.yaml 是這個專案的交付物，用來證明可重現性，
   但無法在這台開發機上實際 build 或驗證，寫的時候要更嚴謹地照規格來
@@ -585,6 +594,50 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   修好之後，這個檢測層級可以順便當驗證修復是否生效的工具（就像
   `blend.py` 那次的霧化色塊一樣，是一個額外的診斷手段，不只是防禦
   機制）。
+- **canvas 超線性成長是旋轉/scale 退化的第二種代價，不是獨立問題——第一種
+  代價是幾何扭曲本身（見上面），這次用真實記憶體診斷量化出第二種代價：
+  記憶體**。用真實 `data/`（0299~0330 系列，52 張裡取樣）跑過一次純診斷
+  （沒有改動 `src/sea_mosaic/` 任何程式碼）：沿同一條真實序列，把影像數量
+  N 從 2 逐步加到 50，每個 N 都重新跑一次 `compose_global_transforms` +
+  `compute_canvas_size`（刻意不呼叫 `warp_images`/`blend_images`——純幾何
+  計算，不配置任何 canvas 尺寸的陣列，任何 N 都安全，可以放心跑到 50）。
+  結果：canvas 面積從 N=2 的 55.1 Mpx 一路長到 N=50 的 293.0 Mpx（5.3
+  倍），而且不是平滑成長——N=11~20 之間一度停滯在 171.2 Mpx（第一次看
+  到這個現象時誤判是「已經收斂的平原」），但 N=27 之後又恢復劇烈成長，
+  到 N=50 已經逼近 300 Mpx。這個忽停滯忽暴衝、非單調的模式，跟已經
+  記錄的旋轉/scale 退化（節點的 scale 忽然崩潰或暴衝、旋轉角度不連續）
+  是同一個根因在不同層面的表現：`compute_canvas_size` 算的是「包住每張
+  影像四個角點投影後的最小外接矩形」，退化把某些節點的角點投影到離群的
+  極端座標，canvas 只是如實反映這個離群程度，兩者不是各自獨立的兩個
+  問題。
+- **上面的 canvas 超線性成長，疊加 `warp_images`/`blend_images` 目前
+  「每張影像的完整 canvas 尺寸陣列同時全部留在記憶體裡」的架構（記憶體
+  用量是 O(N × canvas_size)，不是 O(canvas_size)），已經用真實 cgroup
+  記憶體量測驗證是真實資料集在張數變多時被 OOM killer 殺掉的根因**
+  （見上面「環境」段落：這個 pod 的真實記憶體上限是 60GB，不是 `free -h`
+  顯示的主機總量）。實測 N=20（真的跑完 `warp_images` + `blend_images`，
+  沒有被殺）cgroup 峰值用量 ≈54GB，跟用「`N×canvas×4bytes`（`blend_images`
+  裡的 `weights` 字典跟 `seam_masks` 字典，在迴圈跑完的當下兩者是同時
+  存活的，不是先釋放一個再建另一個）+ `canvas×8bytes`（`total_weight`）
+  + `canvas×24bytes`（`mosaic` 累加器）+ 單次迭代的暫態 float64 陣列」
+  推導出的公式預測值（54.8GB）幾乎精確吻合，驗證了這個記憶體模型是對的。
+  用同一個模型外插（純公式推算，沒有真的跑，因為預測值遠超這個 pod 的
+  上限，真的跑會有被 OOM killer 殺掉、影響這個共用 pod 上其他人的真實
+  風險）：這條真實序列的記憶體用量大約在 N≈22~23 就會超過 60GB 上限，
+  N=50 時推算高達 ≈199GB——「50 張被 Killed」不是因為 50 這個數字本身
+  特別，是因為這批資料的 canvas 早在 N≈22~23 附近就已經逼近上限，50
+  只是遠遠超過那個早就存在的臨界點。這組具體數字（N≈22~23、199GB）全部
+  綁定這批舊資料自己的 canvas 成長曲線，10 月正式資料集的張數（幾百幾千
+  張規模）、飛行模式、退化程度都可能完全不同，不能直接沿用這裡的具體
+  數字去預測正式資料集會在第幾張撐不住。但**兩個結構性結論會沿用，不
+  受資料集換掉影響**：(1) O(N × canvas_size) 的記憶體架構，只要資料量
+  夠大，必然會撞上某個記憶體上限，不管那個上限是 60GB 還是別的數字——
+  這是架構本身的問題，不是這批資料特有的；(2) 如果旋轉/scale 退化問題
+  到 10 月依然存在，canvas 本身的失控成長會讓這個上限被提前撞上——把
+  記憶體架構改成 O(canvas_size)（不再隨 N 成長，見下面「目前狀態」的
+  streaming accumulator 待辦，已有設計、尚未實作）解決的是問題 (1)，
+  不是問題 (2)；問題 (2) 仍然要靠旋轉/scale 退化本身被修好才能真正解決
+  （10 月重新評估），兩者要分開處理，修好其中一個不代表另一個就不用管了
 - **`io_utils.py` 的 `load_image`/`load_images` 仍是 `...` 空殼**（沒有真的用
   PIL/cv2 讀圖、也沒有測試覆蓋），已經在兩個不同任務裡各撞到一次：
   第一次是 SIFT `match_pair` 對照實驗（0352 vs 0353 inlier_ratio 診斷），
@@ -796,4 +849,24 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     怎麼定、圖片本身要不要也是 `run_pipeline` 自動寫檔（目前
     `run_pipeline` 只回傳 `(mosaic, metrics_df)`，沒有寫任何檔案）,
     這些是新的、獨立的設計決定,不屬於「串接四段管線」這輪的範圍。
+  - [ ] warp.py/blend.py/pipeline.py: streaming accumulator 記憶體重構
+    （設計已完成，尚未實作）——把記憶體用量從 O(N × canvas_size) 降到
+    O(canvas_size)，不再隨影像數量 N 成長，見上面「已知的限制」canvas
+    超線性成長 + cgroup 記憶體診斷那兩條記錄，跟旋轉/scale 退化是同一條
+    診斷鏈但要分開處理：這個待辦解決的是「架構本身在資料量大時必然撞
+    記憶體上限」，不解決「canvas 本身為什麼會失控成長」（那個仍然暫緩到
+    10 月）。設計要點：(1) `blend_images` 的加權平均改成單一 pass 的
+    streaming accumulator（`weighted_sum`/`weight_sum` 兩個固定大小的
+    累加陣列，逐張影像折入後即可丟棄該影像的 canvas 尺寸暫存陣列，
+    數學上等價於現有「先正規化成 alpha 再加權平均」的兩階段做法）；
+    (2) 光改 blend_images 不夠，`warp_images` 目前的回傳型別（一次
+    materialize 全部 N 張 canvas 尺寸影像的 dict）本身就是 O(N×canvas)
+    的源頭之一，需要一併改成逐張產生而非一次全部回傳，兩個階段才能
+    真正合併成一個 O(canvas_size) 的 streaming pass；(3) 已發現一個
+    未解的阻塞點：`metrics.py` 的 `compute_seam_error` 對
+    `warped_images`/`warped_masks` 做 all-pairs（O(N²)）比對，需要同時
+    存取所有 N 張 canvas 尺寸影像，跟 streaming 設計直接衝突，在
+    streaming 版本真正實作前必須先決定怎麼處理（重新設計
+    `compute_seam_error` 本身、接受它保留自己的一份記憶體成本，還是用
+    bounding-box 預篩選 + 隨需重算），這個決定還沒有做
 - [ ] FastAPI

@@ -15,11 +15,16 @@ coordinates are (x, y) with x=column in [0, width], y=row in [0, height].
 
 from __future__ import annotations
 
+import gc
+import weakref
+from unittest import mock
+
+import cv2
 import numpy as np
 import pytest
 
 from sea_mosaic.types import GlobalTransforms
-from sea_mosaic.warp import compute_canvas_size, warp_images
+from sea_mosaic.warp import compute_canvas_size, warp_images, warp_images_streaming
 
 
 def _translation(tx: float, ty: float) -> np.ndarray:
@@ -251,3 +256,162 @@ def test_warp_images_rotation_places_marker_pixel_at_hand_computed_coordinate():
     # canvas (10,10) maps back to source (x=10,y=10), an interior background pixel
     # (only (15,5) is non-zero in the source image) -- unambiguous, not a boundary corner
     assert np.array_equal(warped.images[0][10, 10], np.zeros(3, dtype=np.uint8))
+
+
+# --- warp_images_streaming: bit-exact equivalence to warp_images (gating tests) ---------
+#
+# warp_images_streaming is a pure memory-management change over warp_images (per-image
+# generator instead of an eagerly materialized dict), not a logic change -- it calls the
+# identical cv2.warpPerspective per image with no arithmetic reordering, so unlike
+# blend_images_streaming's weighted-average math (see test_blend.py), there is no
+# floating-point-reassociation caveat here: equivalence must be true bit-exact
+# (np.array_equal), with no tolerance.
+#
+# API convention (per design discussion): the caller computes canvas_size once via the
+# existing compute_canvas_size and passes it to warp_images_streaming, rather than
+# warp_images_streaming recomputing it internally -- keeps compute_canvas_size's single
+# responsibility, no new class/attribute-carrying-generator needed.
+
+
+def test_warp_images_streaming_matches_warp_images_bitexact_single_image_identity():
+    image = _distinctive_image(10, 15)
+    transforms = _global_transforms({0: np.eye(3)})
+    canvas_size = compute_canvas_size({0: image.shape[:2]}, transforms)
+
+    warped, masks = warp_images({0: image}, transforms)
+    streamed = list(warp_images_streaming({0: image}, transforms, canvas_size))
+
+    assert len(streamed) == 1
+    index, warped_image, warped_mask = streamed[0]
+    assert index == 0
+    assert np.array_equal(warped_image, warped.images[0])
+    assert np.array_equal(warped_mask, masks.masks[0])
+
+
+def test_warp_images_streaming_matches_warp_images_bitexact_two_images_translation():
+    images, transforms = _two_image_translation_scenario()
+    image_shapes = {index: image.shape[:2] for index, image in images.items()}
+    canvas_size = compute_canvas_size(image_shapes, transforms)
+
+    warped, masks = warp_images(images, transforms)
+    streamed = {
+        index: (warped_image, warped_mask)
+        for index, warped_image, warped_mask in warp_images_streaming(images, transforms, canvas_size)
+    }
+
+    assert set(streamed) == set(images)
+    for index in images:
+        streamed_image, streamed_mask = streamed[index]
+        assert np.array_equal(streamed_image, warped.images[index])
+        assert np.array_equal(streamed_mask, masks.masks[index])
+
+
+def test_warp_images_streaming_matches_warp_images_bitexact_rotation():
+    """Rotation exercises actual corner/pixel remapping (not just a translated offset),
+    matching why test_warp_images_rotation_places_marker_pixel_at_hand_computed_coordinate
+    exists for warp_images itself."""
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    image[5, 15] = [255, 0, 0]
+    transforms = _global_transforms({0: _rotation_90()})
+    canvas_size = compute_canvas_size({0: image.shape[:2]}, transforms)
+
+    warped, masks = warp_images({0: image}, transforms)
+    streamed = list(warp_images_streaming({0: image}, transforms, canvas_size))
+
+    assert len(streamed) == 1
+    index, warped_image, warped_mask = streamed[0]
+    assert index == 0
+    assert np.array_equal(warped_image, warped.images[0])
+    assert np.array_equal(warped_mask, masks.masks[0])
+
+
+def test_warp_images_streaming_canvas_size_matches_warp_images():
+    images, transforms = _two_image_translation_scenario()
+    image_shapes = {index: image.shape[:2] for index, image in images.items()}
+    canvas_size = compute_canvas_size(image_shapes, transforms)
+
+    warped, _masks = warp_images(images, transforms)
+    for _index, warped_image, warped_mask in warp_images_streaming(images, transforms, canvas_size):
+        assert warped_image.shape[:2] == warped.canvas_size
+        assert warped_mask.shape[:2] == warped.canvas_size
+
+
+# --- warp_images_streaming: actually lazy, not just correct -----------------------------
+#
+# The equivalence tests above only prove "same math." They cannot catch the failure mode
+# this redesign exists to prevent: an implementation that is technically a generator (or
+# even yields the right values in the right order) but secretly does all N images' work
+# up front, or secretly accumulates already-yielded arrays in some internal cache --
+# either of which would silently defeat the whole point (O(canvas_size) memory,
+# independent of N) while still passing every equivalence test above.
+
+
+def _five_image_scenario() -> tuple[dict[int, np.ndarray], GlobalTransforms, tuple[int, int]]:
+    images = {i: _distinctive_image(6, 6) for i in range(5)}
+    transforms = _global_transforms({i: _translation(tx=i * 3, ty=0) for i in range(5)})
+    canvas_size = compute_canvas_size({i: img.shape[:2] for i, img in images.items()}, transforms)
+    return images, transforms, canvas_size
+
+
+def test_warp_images_streaming_only_warps_images_actually_consumed_so_far():
+    """Patches the actual expensive canvas-sized operation (cv2.warpPerspective, called
+    twice per image: once for the image, once for its mask) rather than inspecting
+    internal image-dict access patterns, so this test's validity does not depend on
+    whether the implementation iterates via .items(), [key] lookups, or anything else --
+    it directly measures the claim: has the expensive per-image work happened only for
+    images consumed so far, not all N up front.
+
+    This also catches the specific 'list built eagerly then yielded from' degenerate
+    pattern: building `results = [...]` before any `yield` would make the FIRST next()
+    call trigger all N images' worth of work at once (call_count jumping straight to
+    2*N), not the 2-per-next() progression asserted here."""
+    images, transforms, canvas_size = _five_image_scenario()
+
+    call_count = 0
+    real_warp_perspective = cv2.warpPerspective
+
+    def _counting_warp_perspective(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_warp_perspective(*args, **kwargs)
+
+    with mock.patch("sea_mosaic.warp.cv2.warpPerspective", side_effect=_counting_warp_perspective):
+        stream = warp_images_streaming(images, transforms, canvas_size)
+        assert call_count == 0  # constructing the generator must not warp anything yet
+
+        next(stream)
+        assert call_count == 2  # exactly one image's (image, mask) pair, not all 5
+
+        next(stream)
+        assert call_count == 4
+
+        next(stream)
+        assert call_count == 6
+
+
+def test_warp_images_streaming_does_not_retain_already_yielded_arrays():
+    """Guards against a subtler degenerate pattern than the call-counting test above: an
+    implementation that IS correctly lazy per next() call (would pass that test) but still
+    accidentally accumulates a growing internal history/cache of already-yielded arrays
+    (e.g. a debugging leftover) -- which would silently defeat the O(canvas_size) memory
+    goal even though external call timing looks correctly lazy.
+
+    Verified via weakref (confirmed to work on plain np.ndarray -- see this session's
+    diagnostic): once this test's own (only external) reference to an already-yielded
+    array is dropped AND the generator has moved past that item (so its own loop-local
+    variable, which legitimately still holds the just-yielded value while paused at a
+    yield, has been reassigned to the next item), nothing else in the process should be
+    keeping the old array alive."""
+    images, transforms, canvas_size = _five_image_scenario()
+    stream = warp_images_streaming(images, transforms, canvas_size)
+
+    _index0, warped_image0, warped_mask0 = next(stream)
+    weak_image0 = weakref.ref(warped_image0)
+    weak_mask0 = weakref.ref(warped_mask0)
+
+    del warped_image0, warped_mask0
+    next(stream)  # advance past item 0 -- any well-behaved loop reassigns its locals here
+    gc.collect()
+
+    assert weak_image0() is None
+    assert weak_mask0() is None

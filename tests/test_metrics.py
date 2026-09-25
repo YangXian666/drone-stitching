@@ -12,6 +12,8 @@ import pandas as pd
 import pytest
 
 from sea_mosaic.metrics import (
+    _bboxes_overlap,
+    _image_canvas_bbox,
     build_metrics_dataframe,
     compute_cycle_loop_error,
     compute_distortion,
@@ -168,6 +170,98 @@ def test_seam_error_identical_overlap():
     error = compute_seam_error(warped_images, warped_masks)
 
     assert error == pytest.approx(0.0, abs=1e-9)
+
+
+# --- compute_seam_error bounding-box prefilter helpers (streaming redesign, gating) -----
+#
+# _image_canvas_bbox / _bboxes_overlap are the low-level building blocks for the
+# bounding-box-prefiltered candidate-pair selection that will replace compute_seam_error's
+# current all-pairs O(N^2) loop over fully materialized warped_images/warped_masks (see
+# CLAUDE.md's streaming-accumulator backlog item). Tested here in isolation, matching this
+# repo's existing convention of unit-testing small private geometry helpers directly (e.g.
+# posegraph.py's _yaw_target_vector) rather than only through the public function that
+# calls them.
+#
+# _bboxes_overlap's boundary convention is deliberately INCLUSIVE (a shared edge/corner
+# counts as overlapping): this filter's only correctness requirement is "never produce a
+# false negative" (see the design's "safe superset, not exact" principle) -- an
+# over-included pair costs a little wasted work, checked away precisely by the existing
+# pixel-level `(mask_a>0)&(mask_b>0)` overlap test inside compute_seam_error itself, while
+# an under-included (missed) pair would silently drop a real seam-error contribution.
+
+
+def _translation(tx: float, ty: float) -> np.ndarray:
+    return np.array([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]])
+
+
+def _rotation_90() -> np.ndarray:
+    return np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+
+
+def test_image_canvas_bbox_identity_transform():
+    min_xy, max_xy = _image_canvas_bbox((50, 80), np.eye(3))  # (height, width)
+
+    assert np.array_equal(min_xy, [0.0, 0.0])
+    assert np.array_equal(max_xy, [80.0, 50.0])
+
+
+def test_image_canvas_bbox_translation_shifts_both_corners():
+    min_xy, max_xy = _image_canvas_bbox((50, 80), _translation(tx=10, ty=5))
+
+    assert np.array_equal(min_xy, [10.0, 5.0])
+    assert np.array_equal(max_xy, [90.0, 55.0])
+
+
+def test_image_canvas_bbox_rotation_swaps_width_and_height_extent():
+    """Same hand-computed geometry as
+    test_warp.test_compute_canvas_size_rotation_swaps_width_and_height, since both
+    functions project the same four corners through the same transform -- reusing an
+    already independently-verified computation, not a fresh guess."""
+    min_xy, max_xy = _image_canvas_bbox((40, 100), _rotation_90())  # height=40, width=100
+
+    # corners (0,0),(100,0),(100,40),(0,40) -> (0,0),(0,100),(-40,100),(-40,0)
+    assert np.array_equal(min_xy, [-40.0, 0.0])
+    assert np.array_equal(max_xy, [0.0, 100.0])
+
+
+def test_bboxes_overlap_fully_overlapping():
+    bbox_a = (np.array([0.0, 0.0]), np.array([10.0, 10.0]))
+    bbox_b = (np.array([5.0, 5.0]), np.array([15.0, 15.0]))
+
+    assert _bboxes_overlap(bbox_a, bbox_b) is True
+
+
+def test_bboxes_overlap_fully_disjoint():
+    bbox_a = (np.array([0.0, 0.0]), np.array([10.0, 10.0]))
+    bbox_b = (np.array([20.0, 20.0]), np.array([30.0, 30.0]))
+
+    assert _bboxes_overlap(bbox_a, bbox_b) is False
+
+
+def test_bboxes_overlap_one_contained_in_the_other():
+    bbox_a = (np.array([0.0, 0.0]), np.array([100.0, 100.0]))
+    bbox_b = (np.array([10.0, 10.0]), np.array([20.0, 20.0]))
+
+    assert _bboxes_overlap(bbox_a, bbox_b) is True
+
+
+def test_bboxes_overlap_edge_touching_counts_as_overlapping():
+    """Locks the inclusive boundary convention explicitly (see module docstring above):
+    bbox_a's right edge (x=10) exactly meets bbox_b's left edge (x=10) -- zero-area shared
+    boundary, deliberately treated as an overlap (True), not a disjoint case (False)."""
+    bbox_a = (np.array([0.0, 0.0]), np.array([10.0, 10.0]))
+    bbox_b = (np.array([10.0, 0.0]), np.array([20.0, 10.0]))
+
+    assert _bboxes_overlap(bbox_a, bbox_b) is True
+
+
+def test_bboxes_overlap_degenerate_zero_area_bbox():
+    point_bbox = (np.array([5.0, 5.0]), np.array([5.0, 5.0]))
+    containing_bbox = (np.array([0.0, 0.0]), np.array([10.0, 10.0]))
+    disjoint_bbox = (np.array([6.0, 6.0]), np.array([10.0, 10.0]))
+
+    assert _bboxes_overlap(point_bbox, containing_bbox) is True
+    assert _bboxes_overlap(point_bbox, disjoint_bbox) is False
 
 
 # --- Test 7: Identity Warp Distortion --------------------------------------------------
