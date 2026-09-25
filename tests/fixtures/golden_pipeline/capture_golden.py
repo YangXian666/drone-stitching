@@ -98,8 +98,8 @@ def main() -> None:
     # classification (the part of run_pipeline that has to move from a post-hoc filter
     # over a fully materialized dict to an inline filter over the warp stream)
     if only is None or "isolated_node_without_gps_anchor" in only:
-        images, matcher = _isolated_node_scenario()
-        _capture("isolated_node_without_gps_anchor", images, matcher, _base_config())
+        images, matcher, pairs = _isolated_node_scenario()
+        _capture("isolated_node_without_gps_anchor", images, matcher, _base_config(pairs=pairs))
 
     # 3. nonfinite_transform_isolated -- pre-warp finite-transform filter
     # (compute_canvas_size raises on NaN if not excluded first) combined with

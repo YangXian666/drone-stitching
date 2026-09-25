@@ -985,29 +985,89 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
       行為」，不是遮蓋迴歸，`np.array_equal` 逐位元組相等的比對標準
       維持不變，只換了這一個 golden 檔案內容，另外兩個 golden 檔案
       （byte-for-byte 驗證過未被觸碰）維持原樣。
-  - [ ] **新發現的獨立待辦（不屬於上面 streaming accumulator 重構的
-    範圍，優先程度尚未排定）：`compose_global_transforms` 的
-    pose-graph 求解器本身有一個相當可觀、完全獨立的記憶體成本**，是在
-    驗證上面 streaming 重構的端到端記憶體測試時意外發現的——實測
-    N=100（合成資料，極小 canvas）時，`compose_global_transforms`
-    單獨的 `tracemalloc` peak 是 15,948KB，占同一次 `run_pipeline`
-    呼叫總 peak（16,388KB）的 97%，換句話說：即使
-    `warp_images_streaming`/`blend_images_streaming`/
-    `compute_seam_error_streaming` 已經把它們自己負責的部分修好（同樣
-    情境下單獨量測，N=10→N=100 只從 285.5KB 漲到 544.5KB，比值
-    ≈1.91x，接近打平），`run_pipeline` 整體的記憶體用量還是會隨 N
-    劇烈成長，因為 compose 階段本身完全沒被這次重構碰過。懷疑根因是
-    `optimize_pose_graph` 用 `scipy.optimize.least_squares` 求解時
-    建構的 Jacobian 矩陣是稠密（dense）的，其大小隨 pose-graph 的參數
-    數量（每個 node 6 個自由度）與殘差數量（跟邊數+anchor 數成正比，
-    都跟著 N 成長）而增長，兩者相乘可能是 O(N²) 的來源——但這只是懷疑，
-    還沒有像 streaming 重構那樣實際做過根因驗證（例如拆開量測純
-    Jacobian 建構跟其他步驟各自的貢獻）。**這個待辦的存在本身要被看見，
-    不能因為驗證 streaming 重構的記憶體測試把 `compose_global_transforms`
-    mock 掉、縮小驗證範圍後，這個發現就悄悄消失**——`tests/test_pipeline.py`
-    的 `test_run_pipeline_warp_blend_seam_error_peak_memory_is_flat_
-    not_linear_in_n`（名稱與 docstring 都已明確標註只驗證 warp/blend/
-    seam_error 三段，不涵蓋 compose_global_transforms）就是為了這個
-    範圍收斂而存在，不代表 `run_pipeline` 整體的記憶體用量已經被證明
-    打平
+  - [x] **`compose_global_transforms` 記憶體待辦的後續調查——部分解決，
+    不是完全解決，過程中意外發現一個獨立的 pose-graph 退化案例**：
+    上一輪發現 `compose_global_transforms` 單獨佔 `run_pipeline` 總
+    peak 的 97%（N=100，15,948KB）之後，懷疑根因是稠密 Jacobian 隨
+    pose-graph 規模增長，這一輪做了完整的根因驗證，過程與結論如下：
+    - **稀疏 Jacobian 方向：已評估並推翻**。用真實的殘差結構（每個
+      node 4 個自由度 `a,b,tx,ty`，不是原本猜的 6 個；每條 edge 6 個
+      殘差、依賴 src/dst 兩個 node 共 8 個變數；每個 GPSAnchor/
+      YawAnchor 2 個殘差、依賴自己 node 的 4 個變數）精算：N=100、
+      99 條邊、1 個 GPS anchor（這批合成測資實際只有 1 個，不是每個
+      node 都有）時，稠密 Jacobian 只有 ≈1.9MB，對照 15,948KB 的實測
+      總 peak，即使把 Jacobian 完全消除也只省 ≈12%——落在「邊際改善」
+      的範圍，稀疏化不值得投入，根因在別的地方。
+    - **真正的根因：scipy 預設用數值微分（有限差分）估計 Jacobian，
+      每算一次要呼叫 `residuals()`「參數量+1」次，且每次外層疊代都
+      重算一次**。實測驗證：N=100 時 `residuals()` 總共被呼叫 3,144
+      次，不是 `result.nfev` 顯示的 8 次（那個欄位算的是外層疊代數，
+      不是原始函式呼叫數）——3144 = 8 疊代 × (392+1) 參數，精確吻合，
+      而且不是巧合：檢查了呼叫模式，每組 393 次呼叫裡，392 次都跟
+      該組基準點恰好差 1 個座標，是有限差分數值微分的明確特徵。
+    - **修法：手推封閉形式的解析 Jacobian，取代數值微分**。因為
+      `residuals()` 裡每一項（edge 的旋轉/平移子項、GPSAnchor、
+      YawAnchor）對決策變數都是仿射（沒有任何兩個決策變數的乘積），
+      偏微分有解析封閉形式，而且這個 Jacobian 是「常數矩陣」——不管
+      在哪個參數點估計都一樣（這個結論本身也已經數值驗證過：4 個
+      獨立參數點，包含一個刻意測試的近退化案例，跟 scipy 有限差分的
+      結果逐元素比對，最大誤差 ~1e-9，落在有限差分本身的雜訊範圍內）。
+      驗證方法：手推兩次（edge 項用了兩種獨立推導路徑互相驗證：直接
+      對展開式微分、以及用 `R=a·I+b·J`（I=單位陣，J=90°旋轉生成元）
+      的結構性線性分解重新推一次，逐項吻合）+ sympy 符號運算獨立驗證
+      edge 項 + 數值交叉驗證（`scipy.optimize._numdiff.approx_derivative`
+      對照，4 個點）。實作為 `posegraph.py` 的 `_analytic_jacobian`/
+      `_edge_diff_jacobian_blocks`，接進 `least_squares` 的 `jac=`
+      參數（scipy 的 `jac` 只接受 callable，不接受固定矩陣——但因為
+      這個矩陣本身是常數，callable 直接忽略傳入的參數、回傳同一個
+      預先算好的矩陣即可，不需要 memoization/cache，是很自然的寫法）。
+    - **效果：呼叫次數精確消除，但記憶體只降了一部分，還沒解決**。
+      `residuals()` 呼叫次數從 3,144 精確降到 8（跟疊代次數 1:1，
+      `njev==nfev==8`）——這個部分完全達成預期。但 `compose_global_
+      transforms` 的記憶體 peak 只從 15,948KB 降到 13,411KB
+      （≈16%），遠低於呼叫次數消除的幅度（393 倍 vs 16%）。**這代表
+      「呼叫次數放大」雖然是真實存在、也被正確識別的問題，但不是
+      記憶體 peak 的主要來源**：`tracemalloc` 的 peak 是某個瞬間的
+      最高同時用量，不是所有呼叫的暫態配置總和，如果每次 `residuals()`
+      呼叫自己的暫態配置都有正常釋放、不會跨呼叫累積，呼叫次數再多
+      也不該讓「同一瞬間」的用量變大很多。真正的主導成本比較可能在
+      `scipy.optimize.least_squares`（`method='trf'`）內部——診斷時
+      在 `scipy/optimize/_differentiable_functions.py:754` 附近看到
+      呼叫結束後還留著約 1.8MB 未釋放的配置，但這只是一條線索，還沒
+      追到底（可能是信賴域子問題求解過程中的 QR/SVD workspace，或
+      其他 TRF 內部結構，都還沒驗證）。**這個待辦保持開放，10 月正式
+      上大規模資料前仍需要進一步調查**，跟稀疏 Jacobian 一樣，不要
+      未經驗證就投入下一個「聽起來合理」的方向。
+    - **意外發現、需要獨立記錄的一件事：導入解析 Jacobian 後，某個
+      既有 golden-fixture regression 測試（`isolated_node_without_
+      gps_anchor`）的輸出從 (93,70,3) 變成 (36,22,3)，一度看起來像是
+      解析 Jacobian 推導錯誤，但追查後確認不是**——這個測試情境裡，
+      node 1→2 與 2→3 的邊都刻意設計成失敗（測「孤立節點」的分類
+      邏輯），而這個情境沒有提供任何 GPS 座標，導致 node 3、4 組成
+      一個完全跟主圖（以 node 0 為錨點）斷開、沒有任何 anchor 的
+      子圖。驗證：node 3 對 edge(3,4) 約束的殘差在新結果裡 ≈1e-10
+      （完全收斂、是合法的局部最優解），但 node 3/4 的絕對姿態
+      （scale≈4.68、旋轉≈244°）跟舊結果（scale≈1、旋轉≈0°）完全
+      不同——這是一個真實存在、沿著「整個子圖一起做任意剛體變換
+      不改變彼此的邊殘差」這個方向的平坦/退化方向，數值路徑的極小
+      差異（有限差分 vs 解析）剛好落在這個平坦方向的不同點上，兩個
+      解都是合法局部最優解，不是誰對誰錯。這是 pose graph 退化家族
+      裡的**另一種顯化形式**，跟上面已經記錄的大規模 GPS-anchor
+      耦合造成的 scale 崩潰是同一類根因（結構性缺乏約束，答案對數值
+      路徑敏感），不是解析 Jacobian 引入的新問題——已用 4 種獨立方法
+      驗證過 Jacobian 推導本身正確（兩種手推、sympy、數值交叉驗證）。
+      **處理方式：不重新捕捉這個 golden、不 revert 解析 Jacobian，
+      改成修正測試 fixture 本身的拓樸**——`_isolated_node_scenario`
+      新增一條 `(1,3)` bypass 邊（跳過孤立的 node 2，讓 node 3/4
+      重新連回錨定的主圖），因為 golden-fixture regression 測試的
+      前提是「輸出應該唯一、可比對」，這個前提在斷開子圖的拓樸下
+      從一開始就不成立，繼續拿它當回歸基準是在測一個天生不穩定的
+      東西，不是這次改動造成的。修正後驗證過：新舊 Jacobian 在修正
+      拓樸下收斂到完全相同的 canvas shape (11,16,3)，既有分類斷言
+      （node 2 仍然失敗、其餘成功）也全部不受影響。`all_images_well_
+      matched` 那條 golden 的 1 像素 canvas 差異則維持先前「streaming
+      正確行為」同一套處理方式：重新捕捉，因為兩個結果的
+      `residual_error` 都在 machine-precision 等級（≈1e-16），只是一個
+      接近零的 `b` 參數正負號差異，剛好卡在 canvas 尺寸的整數進位
+      邊界上，不是真實的解不同。
 - [ ] FastAPI

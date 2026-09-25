@@ -117,10 +117,34 @@ def test_run_pipeline_single_image_is_success() -> None:
 # --- B: the three classification paths (edge / GPS anchor / neither) -------------------
 
 
-def _isolated_node_scenario() -> tuple[dict[int, np.ndarray], _ScriptedMatcher]:
+def _isolated_node_scenario() -> tuple[dict[int, np.ndarray], _ScriptedMatcher, list[tuple[int, int]]]:
     """5 images; node 2 is sandwiched between two edges that BOTH fail (too few
     points), isolating it from feature-based positioning entirely, while nodes 1 and 3
-    each keep one good edge of their own (to 0 and 4 respectively) and are unaffected."""
+    each keep one good edge of their own (to 0 and 4 respectively) and are unaffected.
+
+    Includes a (1,3) bypass edge, added after a real analytic-Jacobian regression
+    investigation found that without it, {3,4} form a fully disconnected, unanchored
+    subgraph (no edge and no GPS anchor ties them back to node 0's anchored component,
+    since both edges through node 2 fail and this scenario supplies no gps_positions) --
+    a genuine flat/null direction in the pose-graph cost function (any rigid transform of
+    {3,4} together leaves their own mutual edge residual unchanged), not a bug in any
+    particular Jacobian-computation method. Verified directly: node 3's residual against
+    the (3,4) edge constraint was ~1e-10 (a fully valid local optimum) in BOTH the old
+    (numerical-Jacobian) and new (analytic-Jacobian) results, yet the two runs landed at
+    wildly different absolute poses for {3,4} (scale~1 vs scale~4.68, ~244deg apart) --
+    the solver's tiny floating-point path differences pick a different point along that
+    same flat direction. This is the same pose-graph degeneracy family already recorded
+    in CLAUDE.md's large-scale GPS-anchor-coupled collapse findings, just a different
+    manifestation (answer non-uniqueness from a structurally underconstrained subgraph,
+    not from anchor-vs-edge coupling) -- see CLAUDE.md's 已知的限制 for the full story.
+    A golden-fixture regression test's whole premise is "the output should be unique and
+    comparable"; that premise never held for this topology to begin with, independent of
+    any Jacobian change, so the fix is the topology (reconnect {3,4} to the anchored
+    component via a bypass edge that skips over node 2, exactly as (0,1)/(3,4) already
+    do), not reverting the Jacobian or accepting a non-deterministic golden comparison.
+    The bypass edge does not give node 2 itself any edge or anchor -- it stays genuinely
+    isolated, and every existing classification assertion using this fixture (which node
+    succeeds/fails) is unaffected, verified by rerunning them after this change."""
     images = {i: _tagged_image(i) for i in range(5)}
     matcher = _ScriptedMatcher(
         {
@@ -128,15 +152,20 @@ def _isolated_node_scenario() -> tuple[dict[int, np.ndarray], _ScriptedMatcher]:
             (1, 2): _too_few_points_match_result(),
             (2, 3): _too_few_points_match_result(),
             (3, 4): _good_match_result(),
+            (1, 3): _good_match_result(tx=6.0, ty=4.0),
         }
     )
-    return images, matcher
+    # run_pipeline defaults to sequential_pairs(images) when config.pairs is None, which
+    # would never query the (1,3) bypass above -- every caller must pass this pairs list
+    # through config.pairs explicitly for the bypass edge to actually take effect.
+    pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (1, 3)]
+    return images, matcher, pairs
 
 
 def test_run_pipeline_isolated_node_without_gps_anchor_fails_but_others_succeed() -> None:
-    images, matcher = _isolated_node_scenario()
+    images, matcher, pairs = _isolated_node_scenario()
 
-    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config(pairs=pairs))
 
     assert metrics_df["pipeline_status"][0] == "partial_success"
     assert metrics_df["successful_image_count"][0] == 4
@@ -147,11 +176,11 @@ def test_run_pipeline_isolated_node_with_gps_anchor_still_succeeds() -> None:
     """The one case where option A (structural-only) and option B (quality-gated)
     disagree: node 2 has no valid feature-based edge, but DOES have a GPS anchor --
     per docs/task2.md 3.2's "reference/anchor image...算成功", it must still count."""
-    images, matcher = _isolated_node_scenario()
+    images, matcher, pairs = _isolated_node_scenario()
     gps_positions = {2: np.array([0.0, 0.0])}
 
     _mosaic, metrics_df = run_pipeline(
-        images, matcher, _base_config(gps_positions=gps_positions)
+        images, matcher, _base_config(gps_positions=gps_positions, pairs=pairs)
     )
 
     assert metrics_df["pipeline_status"][0] == "success"
@@ -344,9 +373,9 @@ def test_run_pipeline_finite_degenerate_transform_needs_no_special_isolation_mec
 
 
 def test_run_pipeline_metrics_df_matches_computed_classification() -> None:
-    images, matcher = _isolated_node_scenario()
+    images, matcher, pairs = _isolated_node_scenario()
 
-    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config(pairs=pairs))
 
     assert metrics_df["input_image_count"][0] == 5
     assert (
@@ -456,10 +485,10 @@ def test_run_pipeline_matches_golden_isolated_node_without_gps_anchor() -> None:
     """Exercises the classification path (edge/anchor-based) that has to move from a
     post-hoc filter over a fully materialized warped_masks dict into an inline filter
     over the warp stream -- the part of this integration that's more than a rename."""
-    images, matcher = _isolated_node_scenario()
+    images, matcher, pairs = _isolated_node_scenario()
     golden_mosaic, golden_metrics = _load_golden("isolated_node_without_gps_anchor")
 
-    mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    mosaic, metrics_df = run_pipeline(images, matcher, _base_config(pairs=pairs))
 
     assert np.array_equal(mosaic, golden_mosaic)
     _assert_metrics_df_matches_golden(metrics_df, golden_metrics)

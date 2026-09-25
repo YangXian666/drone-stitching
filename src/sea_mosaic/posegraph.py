@@ -220,6 +220,112 @@ def _yaw_target_vector(relative_yaw_deg: float) -> np.ndarray:
     return np.array([np.cos(theta_target_rad), np.sin(theta_target_rad)])
 
 
+_I2 = np.eye(2)
+_J2 = np.array([[0.0, -1.0], [1.0, 0.0]])  # generator: [[a,-b],[b,a]] = a*_I2 + b*_J2
+
+
+def _edge_diff_jacobian_blocks(R_rel: np.ndarray, t_rel: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """d(diff)/d(src params) and d(diff)/d(dst params) for one edge's 6-component diff
+    vector (see optimize_pose_graph's residuals(): diff = predicted_src - poses[src][:2,:],
+    flattened row-major). Each returned block is shape (6, 4), columns ordered (a,b,tx,ty).
+
+    diff = predicted_src(dst params) - M(src params), where M(a,b,tx,ty) = [a*_I2+b*_J2 |
+    tx,ty] is exactly linear in its own node's params, so d(diff)/d(src) = -d(M)/d(src).
+    predicted_src = [R_dst@R_rel | R_dst@t_rel + t_dst] with R_dst = a_d*_I2 + b_d*_J2 is
+    linear in dst's params too, since R_rel/t_rel are fixed edge data (not decision
+    variables). Neither block depends on the evaluation point -- this Jacobian is a
+    constant matrix, verified by hand (two independent derivations agreeing on every
+    entry), cross-checked with sympy, and cross-checked numerically against scipy's own
+    finite-difference Jacobian at 4 independent parameter points (max diff ~1e-9,
+    consistent with finite-difference noise, not an analytic error) -- see CLAUDE.md's
+    analytic-Jacobian design review for the full derivation.
+    """
+    d_src_da = -np.array([_I2[0, 0], _I2[0, 1], 0.0, _I2[1, 0], _I2[1, 1], 0.0])
+    d_src_db = -np.array([_J2[0, 0], _J2[0, 1], 0.0, _J2[1, 0], _J2[1, 1], 0.0])
+    d_src_dtx = -np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    d_src_dty = -np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    J_diff_src = np.stack([d_src_da, d_src_db, d_src_dtx, d_src_dty], axis=1)
+
+    RR_a = R_rel  # d(R_dst@R_rel)/da_d = _I2@R_rel = R_rel
+    RR_b = _J2 @ R_rel  # d(R_dst@R_rel)/db_d = _J2@R_rel
+    Rt_a = t_rel  # d(R_dst@t_rel)/da_d = _I2@t_rel = t_rel
+    Rt_b = _J2 @ t_rel  # d(R_dst@t_rel)/db_d = _J2@t_rel
+    d_dst_da = np.array([RR_a[0, 0], RR_a[0, 1], Rt_a[0], RR_a[1, 0], RR_a[1, 1], Rt_a[1]])
+    d_dst_db = np.array([RR_b[0, 0], RR_b[0, 1], Rt_b[0], RR_b[1, 0], RR_b[1, 1], Rt_b[1]])
+    d_dst_dtx = np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    d_dst_dty = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    J_diff_dst = np.stack([d_dst_da, d_dst_db, d_dst_dtx, d_dst_dty], axis=1)
+
+    return J_diff_src, J_diff_dst
+
+
+def _analytic_jacobian(
+    graph: PoseGraph, optimizable_indices: list[int], num_params: int
+) -> np.ndarray:
+    """Closed-form Jacobian of optimize_pose_graph's residuals(), row order matching
+    residuals()'s own concatenation order exactly (all edges, then all GPS anchors, then
+    all yaw anchors) so it can be passed straight to scipy.optimize.least_squares's jac=
+    parameter as a drop-in replacement for numerical (finite-difference) estimation.
+
+    Every residual term is affine in its own node's 4 params (a,b,tx,ty) -- no products
+    of two decision variables anywhere in edge/GPSAnchor/YawAnchor residuals -- so this
+    matrix is CONSTANT, independent of which parameter vector it is asked to evaluate
+    "at" (see _edge_diff_jacobian_blocks's docstring for the verification story). Callers
+    exploit this by computing it once and reusing it across every least_squares
+    iteration, rather than treating the argument passed to a jac= callable as meaningful.
+
+    GPSAnchor's block is [[0,0,weight,0],[0,0,0,weight]] (residual = weight*([tx,ty] -
+    const), constant w.r.t. a,b). YawAnchor's block is
+    [[weight,0,0,0],[0,weight,0,0]] (residual = weight*([a,b] - const), constant w.r.t.
+    tx,ty) -- both derived directly (no second cross-check method needed: neither has any
+    product of two decision variables or trigonometric coupling that could hide an error
+    the way the edge term's rotation-matrix products could).
+
+    A node not in optimizable_indices (the fixed reference node) contributes an all-zero
+    column block for any edge/anchor touching it, matching how residuals() itself treats
+    the reference pose as a constant, not a function of flat_params.
+    """
+    node_column = {
+        index: position * _PARAMS_PER_NODE for position, index in enumerate(optimizable_indices)
+    }
+    row_blocks: list[np.ndarray] = []
+
+    for edge in graph.edges:
+        R_rel = edge.relative_pose[:2, :2]
+        t_rel = edge.relative_pose[:2, 2]
+        J_diff_src, J_diff_dst = _edge_diff_jacobian_blocks(R_rel, t_rel)
+        block = np.zeros((6, num_params))
+        if edge.src_index in node_column:
+            c = node_column[edge.src_index]
+            block[:, c : c + _PARAMS_PER_NODE] = edge.information @ J_diff_src
+        if edge.dst_index in node_column:
+            c = node_column[edge.dst_index]
+            block[:, c : c + _PARAMS_PER_NODE] = edge.information @ J_diff_dst
+        row_blocks.append(block)
+
+    for anchor in graph.anchors:
+        block = np.zeros((2, num_params))
+        if anchor.image_index in node_column:
+            c = node_column[anchor.image_index]
+            block[:, c : c + _PARAMS_PER_NODE] = anchor.weight * np.array(
+                [[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+            )
+        row_blocks.append(block)
+
+    for yaw_anchor in graph.yaw_anchors:
+        block = np.zeros((2, num_params))
+        if yaw_anchor.image_index in node_column:
+            c = node_column[yaw_anchor.image_index]
+            block[:, c : c + _PARAMS_PER_NODE] = yaw_anchor.weight * np.array(
+                [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+            )
+        row_blocks.append(block)
+
+    if not row_blocks:
+        return np.zeros((0, num_params))
+    return np.vstack(row_blocks)
+
+
 def optimize_pose_graph(graph: PoseGraph, reference_index: int = 0) -> GlobalTransforms:
     """Optimize the GPS-anchored pose graph to produce global image-to-mosaic transforms.
 
@@ -299,7 +405,16 @@ def optimize_pose_graph(graph: PoseGraph, reference_index: int = 0) -> GlobalTra
             residual_error=residual_error,
         )
 
-    result = least_squares(residuals, initial_params)
+    # Computed once, outside the jac= callable, and reused across every least_squares
+    # iteration -- not memoization/caching, just the natural consequence of the matrix
+    # being provably constant (see _analytic_jacobian's docstring): the callable ignores
+    # the flat_params it is invoked with on purpose. Eliminates the (num_params+1)x
+    # residuals() call amplification that scipy's default numerical (finite-difference)
+    # Jacobian estimation required -- verified empirically (see CLAUDE.md) to drop
+    # residuals() call counts from iterations*(num_params+1) to just iterations, with
+    # identical convergence results.
+    jacobian_matrix = _analytic_jacobian(graph, optimizable_indices, initial_params.size)
+    result = least_squares(residuals, initial_params, jac=lambda flat_params: jacobian_matrix)
     transforms = poses_from_flat(result.x)
 
     if not result.success:
