@@ -7,12 +7,15 @@ these tests are expected to fail until they are implemented.
 
 from __future__ import annotations
 
+import tracemalloc
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from sea_mosaic.metrics import (
     _bboxes_overlap,
+    _candidate_overlapping_pairs,
     _image_canvas_bbox,
     build_metrics_dataframe,
     compute_cycle_loop_error,
@@ -20,9 +23,11 @@ from sea_mosaic.metrics import (
     compute_inlier_statistics,
     compute_reprojection_error,
     compute_seam_error,
+    compute_seam_error_streaming,
     save_metrics_txt,
 )
 from sea_mosaic.types import GlobalTransforms, PairResult, ProcessStats, WarpedImages, WarpedMasks
+from sea_mosaic.warp import compute_canvas_size, warp_images
 
 
 def _pair_result(
@@ -262,6 +267,217 @@ def test_bboxes_overlap_degenerate_zero_area_bbox():
 
     assert _bboxes_overlap(point_bbox, containing_bbox) is True
     assert _bboxes_overlap(point_bbox, disjoint_bbox) is False
+
+
+# --- _candidate_overlapping_pairs: filter correctness (gating) --------------------------
+
+
+def _global_transforms(transforms: dict[int, np.ndarray], reference_index: int = 0) -> GlobalTransforms:
+    return GlobalTransforms(
+        transforms=transforms, reference_index=reference_index,
+        optimization_status="converged", residual_error=0.0,
+    )
+
+
+def _rotation(angle_deg: float) -> np.ndarray:
+    theta = np.radians(angle_deg)
+    c, s = np.cos(theta), np.sin(theta)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def test_candidate_overlapping_pairs_includes_non_adjacent_loop_closure():
+    """The property that actually matters: PipelineConfig.loops already anticipates
+    non-sequential revisits, so a filter that only checked index-adjacent pairs would
+    silently miss a real overlap. Image 4 is placed at EXACTLY image 0's position --
+    genuinely overlapping despite being 4 apart by index -- while image 0 vs image 3
+    (clearly far apart in both index AND space: bbox x[0,50] vs x[120,170], no overlap)
+    proves this isn't a no-op that just returns every pair."""
+    image_shapes = {i: (50, 50) for i in range(5)}
+    transforms = _global_transforms({
+        0: _translation(0, 0),
+        1: _translation(40, 0),
+        2: _translation(80, 0),
+        3: _translation(120, 0),
+        4: _translation(0, 0),  # loop closure: revisits image 0's exact position
+    })
+
+    pairs = _candidate_overlapping_pairs(image_shapes, transforms)
+
+    assert (0, 4) in pairs  # the loop-closure pair -- the whole point of this test
+    assert (0, 3) not in pairs  # clearly disjoint -- proves genuine filtering, not "all pairs"
+    assert (0, 1) in pairs  # sanity: the ordinary adjacent-overlap case still works
+    assert (1, 2) in pairs
+
+
+# --- compute_seam_error_streaming: bit-exact equivalence to compute_seam_error (gating) -
+
+
+def _rotated_bbox_overlap_pixel_disjoint_scenario() -> tuple[dict[int, np.ndarray], GlobalTransforms]:
+    """Deliberately adversarial (see this session's design discussion on "safe superset,
+    not exact"): image 1 is a 40x40 square rotated 45deg about its own (0,0) corner, which
+    turns its bounding box into a diamond's containing rectangle -- x in [-28.28,28.28],
+    y in [0,56.57] (hand-derived: corner (40,40) -> (0,56.57) is the y-max vertex, corner
+    (0,40) -> (-28.28,28.28) is the x-min vertex, etc). A 45deg-rotated square's actual
+    footprint is a diamond inscribed in that rectangle -- touching only the midpoints of
+    each rectangle edge, leaving all four rectangle CORNERS empty by construction (a
+    standard geometric fact about a square rotated 45deg, not specific to this codebase).
+    Image 0 (a plain, unrotated 5x5 square at translation(20,0), occupying x[20,25],
+    y[0,5]) sits entirely inside the empty top-right corner wedge of that bounding
+    rectangle: verified via the diamond's L1-ball inequality |x|+|y-28.28|<=28.28 -- every
+    corner of image 0's 5x5 footprint gives a value >43 (>>28.28), i.e. outside the
+    diamond. So bbox_0 and bbox_1 genuinely overlap (x[20,25] subset of [-28.28,28.28],
+    y[0,5] subset of [0,56.57]) while their real warped pixel footprints do not -- exactly
+    the case _candidate_overlapping_pairs's bbox filter cannot distinguish, and which
+    compute_seam_error's/compute_seam_error_streaming's existing pixel-level
+    `(mask_a>0)&(mask_b>0)` guard must still correctly zero out."""
+    images = {
+        0: np.full((5, 5, 3), 100, dtype=np.uint8),
+        1: np.full((40, 40, 3), 200, dtype=np.uint8),
+    }
+    transforms = _global_transforms({0: _translation(20, 0), 1: _rotation(45)})
+    return images, transforms
+
+
+def _rotated_scenario_empirically_has_no_pixel_overlap(
+    images: dict[int, np.ndarray], transforms: GlobalTransforms
+) -> bool:
+    """Verifies the adversarial fixture's geometry empirically against the actual,
+    already-trusted warp_images output, rather than trusting the hand derivation alone."""
+    image_shapes = {i: img.shape[:2] for i, img in images.items()}
+    canvas_size = compute_canvas_size(image_shapes, transforms)
+    _warped, masks = warp_images(images, transforms)
+    overlap = (masks.masks[0] > 0) & (masks.masks[1] > 0)
+    return not np.any(overlap)
+
+
+_EQUIVALENCE_SCENARIOS = {
+    "two_images_full_overlap": lambda: (
+        {0: np.full((30, 30, 3), 80, dtype=np.uint8), 1: np.full((30, 30, 3), 180, dtype=np.uint8)},
+        _global_transforms({0: _translation(0, 0), 1: _translation(0, 0)}),
+    ),
+    "two_images_partial_overlap": lambda: (
+        {0: np.full((30, 40, 3), 60, dtype=np.uint8), 1: np.full((30, 40, 3), 220, dtype=np.uint8)},
+        _global_transforms({0: _translation(0, 0), 1: _translation(20, 0)}),
+    ),
+    "far_apart_no_overlap": lambda: (
+        {0: np.full((20, 20, 3), 50, dtype=np.uint8), 1: np.full((20, 20, 3), 150, dtype=np.uint8)},
+        _global_transforms({0: _translation(0, 0), 1: _translation(500, 500)}),
+    ),
+    "five_image_line_with_loop_closure": lambda: (
+        {i: np.full((50, 50, 3), (i + 1) * 30, dtype=np.uint8) for i in range(5)},
+        _global_transforms({
+            0: _translation(0, 0), 1: _translation(40, 0), 2: _translation(80, 0),
+            3: _translation(120, 0), 4: _translation(0, 0),
+        }),
+    ),
+    "bbox_overlap_pixel_disjoint_adversarial": _rotated_bbox_overlap_pixel_disjoint_scenario,
+}
+
+
+@pytest.mark.parametrize(
+    "scenario_name", list(_EQUIVALENCE_SCENARIOS), ids=list(_EQUIVALENCE_SCENARIOS)
+)
+def test_compute_seam_error_streaming_matches_compute_seam_error_bitexact(scenario_name):
+    """Bit-exact (not tolerance-based), matching this session's earlier conclusion that
+    compute_seam_error's math is a plain running sum over the SAME set of contributing
+    pairs in the SAME order for both implementations (no per-pixel division like
+    blend_images_streaming has), so unlike that function there is no floating-point-
+    reassociation caveat here -- old and new must agree exactly."""
+    images, transforms = _EQUIVALENCE_SCENARIOS[scenario_name]()
+    image_shapes = {i: img.shape[:2] for i, img in images.items()}
+    canvas_size = compute_canvas_size(image_shapes, transforms)
+    warped_images, warped_masks = warp_images(images, transforms)
+
+    old_error = compute_seam_error(warped_images, warped_masks)
+    new_error = compute_seam_error_streaming(images, transforms, canvas_size)
+
+    if np.isnan(old_error):
+        assert np.isnan(new_error)
+    else:
+        assert new_error == old_error
+
+
+def test_bbox_overlap_pixel_disjoint_scenario_is_empirically_verified_adversarial():
+    """Guards the adversarial fixture itself, not compute_seam_error_streaming: confirms
+    the hand-derived '45deg-rotated diamond leaves its bbox corners empty' geometry
+    actually holds for this exact fixture (via real warp_images output), so the
+    equivalence test case above is known to be exercising the safe-superset property it
+    claims to, not silently degenerating into an ordinary overlapping case."""
+    images, transforms = _rotated_bbox_overlap_pixel_disjoint_scenario()
+
+    assert _rotated_scenario_empirically_has_no_pixel_overlap(images, transforms)
+
+    image_shapes = {i: img.shape[:2] for i, img in images.items()}
+    bbox_0 = _image_canvas_bbox(image_shapes[0], transforms.transforms[0])
+    bbox_1 = _image_canvas_bbox(image_shapes[1], transforms.transforms[1])
+    assert _bboxes_overlap(bbox_0, bbox_1)  # bbox says "maybe" ...
+    # ... but the pixel-level check above says "no" -- this is the case the bbox filter
+    # cannot distinguish, and downstream must still handle correctly (see the
+    # equivalence test's "bbox_overlap_pixel_disjoint_adversarial" case).
+
+
+# --- compute_seam_error_streaming: peak memory stays flat as N grows --------------------
+
+
+def _synthetic_sparse_line_scenario(
+    n: int, total_span: float = 200.0, image_height: int = 20
+) -> tuple[dict[int, np.ndarray], GlobalTransforms]:
+    """n images spread along a FIXED-length line (total_span does not grow with n), each
+    only overlapping its immediate neighbor by half its own width -- matching a realistic
+    flight line's sparse overlap (each image touches ~2 neighbors, not all n-1 others).
+
+    An earlier version of this fixture placed all n images at the identical position to
+    hold canvas_size fixed; that made every pair a candidate (n*(n-1)/2 -- ~4950 for
+    n=100), and for a small canvas the resulting Python-level candidate-pair LIST itself
+    (not per-image pixel data) dominated the traced memory, an honest but different cost
+    from the one this test means to isolate. This version decouples the two properties
+    that matter instead of conflating them: image_width shrinks as n grows
+    (image_width = 2 * total_span/n) so canvas_size stays close to total_span regardless
+    of n (verified: canvas width 220px at n=10 vs 202px at n=100, not the ~10x growth an
+    n-proportional line would produce), while overlap stays sparse (each image still only
+    overlaps ~2 immediate neighbors, so candidate-pair count grows ~linearly with n --
+    verified: 17 pairs at n=10 vs 197 at n=100, not n^2/2). warpPerspective's OUTPUT array
+    size is always canvas_size regardless of the SOURCE image's width, so shrinking source
+    width does not itself reduce the per-pair memory cost being measured -- it only keeps
+    overlap sparse, which is the property needed here."""
+    step = total_span / n
+    image_width = int(round(step * 2))
+    images = {
+        i: np.full((image_height, image_width, 3), (i % 200) + 1, dtype=np.uint8) for i in range(n)
+    }
+    transforms = _global_transforms({i: _translation(i * step, 0) for i in range(n)})
+    return images, transforms
+
+
+def _peak_traced_bytes_for_seam_error(n: int) -> int:
+    images, transforms = _synthetic_sparse_line_scenario(n)
+    image_shapes = {i: img.shape[:2] for i, img in images.items()}
+    canvas_size = compute_canvas_size(image_shapes, transforms)
+
+    tracemalloc.start()
+    try:
+        tracemalloc.clear_traces()
+        compute_seam_error_streaming(images, transforms, canvas_size)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak
+
+
+def test_compute_seam_error_streaming_peak_memory_is_flat_not_linear_in_n():
+    """Same acceptance-criterion methodology as blend_images_streaming's flatness test:
+    N grows 10x (10 -> 100); peak memory should stay far below a 10x increase, since only
+    2 images' canvas-sized pixel data should ever be alive at once (the current candidate
+    pair being evaluated), never all N."""
+    peak_10 = _peak_traced_bytes_for_seam_error(10)
+    peak_100 = _peak_traced_bytes_for_seam_error(100)
+
+    ratio = peak_100 / peak_10
+    assert ratio < 2.0, (
+        f"peak traced memory scaled {ratio:.2f}x going from N=10 to N=100 "
+        f"(peak_10={peak_10} bytes, peak_100={peak_100} bytes) -- expected roughly flat "
+        f"(bounded by 2 images' worth of canvas-sized data), not O(N)"
+    )
 
 
 # --- Test 7: Identity Warp Distortion --------------------------------------------------

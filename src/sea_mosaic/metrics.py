@@ -10,10 +10,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import pandas as pd
 
 from sea_mosaic.types import GlobalTransforms, PairResult, ProcessStats, WarpedImages, WarpedMasks
+from sea_mosaic.warp import _mosaic_bounds
 
 _METRICS_SCHEMA_COLUMNS = [
     # Pipeline process statistics
@@ -179,6 +181,42 @@ def compute_cycle_loop_error(
     return float(np.mean(loop_rmses))
 
 
+def _accumulate_pair_seam_diff(
+    img_a: np.ndarray,
+    img_b: np.ndarray,
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    band: np.ndarray | None = None,
+) -> tuple[float, int]:
+    """Mean-absolute-RGB-difference contribution from one image pair's overlap region
+    (optionally further restricted to a seam band), shared verbatim by compute_seam_error
+    (band from seam_masks when given) and compute_seam_error_streaming (band always None,
+    since the streaming blend path never produces a seam_masks dict -- see
+    compute_seam_error_streaming's docstring). Extracted so both implementations run the
+    literal same pixel-comparison code, not two independently-written copies that could
+    silently diverge -- what a caller compares (whole overlap vs. a specific pair) differs,
+    this arithmetic does not.
+
+    Returns (0.0, 0) when there is no actual pixel overlap -- deliberately a real
+    contribution of zero, not a sentinel -- so a caller can sum this across many pairs
+    (including ones the caller only suspects might overlap, e.g. a bounding-box-prefiltered
+    candidate that turns out not to) without special-casing "did this pair contribute."
+    """
+    overlap = (np.asarray(mask_a) > 0) & (np.asarray(mask_b) > 0)
+    if band is not None:
+        overlap = overlap & band
+
+    if not np.any(overlap):
+        return 0.0, 0
+
+    a_f = img_a.astype(np.float32) / 255.0
+    b_f = img_b.astype(np.float32) / 255.0
+    diff = np.abs(a_f - b_f)
+    pixel_diff = diff[overlap]
+
+    return float(np.sum(pixel_diff)), int(pixel_diff.size)
+
+
 def compute_seam_error(
     warped_images: WarpedImages | None,
     warped_masks: WarpedMasks | None,
@@ -203,8 +241,7 @@ def compute_seam_error(
             if img_a is None or img_b is None or mask_a is None or mask_b is None:
                 continue
 
-            overlap = (np.asarray(mask_a) > 0) & (np.asarray(mask_b) > 0)
-
+            band = None
             if seam_masks is not None:
                 band_a = seam_masks.get(idx_a)
                 band_b = seam_masks.get(idx_b)
@@ -213,21 +250,137 @@ def compute_seam_error(
                     band = band_parts[0]
                     for extra in band_parts[1:]:
                         band = band | extra
-                    overlap = overlap & band
 
-            if not np.any(overlap):
-                continue
-
-            a_f = img_a.astype(np.float32) / 255.0
-            b_f = img_b.astype(np.float32) / 255.0
-            diff = np.abs(a_f - b_f)
-            pixel_diff = diff[overlap]
-
-            total_abs_diff += float(np.sum(pixel_diff))
-            total_pixel_count += pixel_diff.size
+            abs_diff, pixel_count = _accumulate_pair_seam_diff(img_a, img_b, mask_a, mask_b, band)
+            total_abs_diff += abs_diff
+            total_pixel_count += pixel_count
 
     if total_pixel_count == 0:
         return np.nan
+
+    return total_abs_diff / total_pixel_count
+
+
+def _image_canvas_bbox(
+    image_shape: tuple[int, int], transform: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bounding box (min_xy, max_xy) of one image's four corners after applying its own
+    transform, in mosaic/canvas coordinates. Per-image analog of warp._mosaic_bounds
+    (which combines all images into one shared bounding box) -- deliberately a small,
+    self-contained duplicate of that corner-projection math rather than reusing
+    _mosaic_bounds via a single-entry dict, since that would mean constructing a throwaway
+    GlobalTransforms just to project one image's corners."""
+    height, width = image_shape
+    corners = np.array(
+        [[0, 0, 1], [width, 0, 1], [width, height, 1], [0, height, 1]],
+        dtype=np.float64,
+    ).T
+    projected = transform @ corners
+    projected_xy = projected[:2, :] / projected[2, :]
+    return projected_xy.min(axis=1), projected_xy.max(axis=1)
+
+
+def _bboxes_overlap(
+    bbox_a: tuple[np.ndarray, np.ndarray], bbox_b: tuple[np.ndarray, np.ndarray]
+) -> bool:
+    """Whether two axis-aligned bounding boxes (min_xy, max_xy) overlap, INCLUSIVE of a
+    shared boundary (a touching edge or corner counts as overlapping). This is
+    deliberately the safe direction for a prefilter whose only correctness requirement is
+    "never produce a false negative" (see _candidate_overlapping_pairs): an over-included
+    pair costs a little wasted work, checked away precisely by the existing pixel-level
+    overlap test in _accumulate_pair_seam_diff; an excluded (missed) pair would silently
+    drop a real seam-error contribution, which is not recoverable downstream."""
+    min_a, max_a = bbox_a
+    min_b, max_b = bbox_b
+    return bool(
+        min_a[0] <= max_b[0]
+        and min_b[0] <= max_a[0]
+        and min_a[1] <= max_b[1]
+        and min_b[1] <= max_a[1]
+    )
+
+
+def _candidate_overlapping_pairs(
+    image_shapes: dict[int, tuple[int, int]], global_transforms: GlobalTransforms
+) -> list[tuple[int, int]]:
+    """Bounding-box-prefiltered candidate pairs for compute_seam_error_streaming: a safe
+    superset (never misses a real overlap, see _bboxes_overlap) of pairs whose images
+    might genuinely overlap in canvas space, computed entirely from cheap per-image corner
+    projections -- no canvas-sized arrays, no assumption that only index-adjacent images
+    can overlap (a loop-closure revisit, already anticipated by PipelineConfig.loops, can
+    make far-apart indices spatially coincide). Iterates sorted indices in the same
+    ascending (i, j) order compute_seam_error's own all-pairs loop uses, so a caller that
+    processes only the contributing subset of these pairs accumulates in the identical
+    order the eager implementation does."""
+    indices = sorted(image_shapes)
+    bboxes = {
+        index: _image_canvas_bbox(image_shapes[index], global_transforms.transforms[index])
+        for index in indices
+    }
+    pairs = []
+    for i in range(len(indices)):
+        for j in range(i + 1, len(indices)):
+            idx_a, idx_b = indices[i], indices[j]
+            if _bboxes_overlap(bboxes[idx_a], bboxes[idx_b]):
+                pairs.append((idx_a, idx_b))
+    return pairs
+
+
+def compute_seam_error_streaming(
+    images: dict[int, np.ndarray],
+    global_transforms: GlobalTransforms,
+    canvas_size: tuple[int, int],
+) -> float:
+    """Bounding-box-prefiltered, on-demand-rewarp form of compute_seam_error: instead of
+    requiring a fully materialized WarpedImages/WarpedMasks (all N canvas-sized images
+    alive simultaneously -- the O(N * canvas_size) cost warp_images_streaming/
+    blend_images_streaming exist to avoid), this sources each candidate pair's pixel data
+    by re-warping only the 2 source images involved, on demand, discarding them before
+    moving to the next pair. Trades some redundant CPU (an image touching K candidate
+    pairs gets re-warped K times) for bounded memory: at most 2 images' worth of
+    canvas-sized data alive at once, independent of N.
+
+    Candidate pairs come from _candidate_overlapping_pairs. The existing pixel-level
+    overlap guard (shared verbatim with compute_seam_error via _accumulate_pair_seam_diff)
+    still precisely excludes any bbox-only candidate that turns out to have no real pixel
+    overlap, so this produces the exact same total (same contributing pairs, same order,
+    same arithmetic) as compute_seam_error given the equivalent eagerly-warped input.
+
+    No seam_masks parameter: blend_images_streaming deliberately does not produce one (see
+    its docstring), and docs/task2.md documents seam_masks as optional for the seam metric
+    ("如果 pipeline 本身有 seam finder，請額外保留") -- this always falls back to the same
+    overlap-region behavior as compute_seam_error(..., seam_masks=None).
+    """
+    image_shapes = {index: image.shape[:2] for index, image in images.items()}
+    candidate_pairs = _candidate_overlapping_pairs(image_shapes, global_transforms)
+    if not candidate_pairs:
+        return float(np.nan)
+
+    min_xy, _max_xy = _mosaic_bounds(image_shapes, global_transforms)
+    dsize = (canvas_size[1], canvas_size[0])
+    origin_offset = np.array(
+        [[1.0, 0.0, -min_xy[0]], [0.0, 1.0, -min_xy[1]], [0.0, 0.0, 1.0]]
+    )
+
+    def _warp_one(index: int) -> tuple[np.ndarray, np.ndarray]:
+        image = images[index]
+        transform = origin_offset @ global_transforms.transforms[index]
+        warped_image = cv2.warpPerspective(image, transform, dsize)
+        full_mask = np.full(image.shape[:2], 255, dtype=np.uint8)
+        warped_mask = cv2.warpPerspective(full_mask, transform, dsize)
+        return warped_image, warped_mask
+
+    total_abs_diff = 0.0
+    total_pixel_count = 0
+    for idx_a, idx_b in candidate_pairs:
+        img_a, mask_a = _warp_one(idx_a)
+        img_b, mask_b = _warp_one(idx_b)
+        abs_diff, pixel_count = _accumulate_pair_seam_diff(img_a, img_b, mask_a, mask_b)
+        total_abs_diff += abs_diff
+        total_pixel_count += pixel_count
+
+    if total_pixel_count == 0:
+        return float(np.nan)
 
     return total_abs_diff / total_pixel_count
 
