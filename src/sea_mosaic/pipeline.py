@@ -7,16 +7,16 @@ import time
 import numpy as np
 import pandas as pd
 
-from sea_mosaic.blend import blend_images
+from sea_mosaic.blend import blend_images_streaming
 from sea_mosaic.compose import compose_global_transforms
 from sea_mosaic.config import PipelineConfig
 from sea_mosaic.estimate import default_inlier_count_reference, match_pair, sequential_pairs
 from sea_mosaic.geo.camera import CameraIntrinsics, CameraPose
 from sea_mosaic.geo.projection import estimate_pixels_per_meter
 from sea_mosaic.matcher import Matcher
-from sea_mosaic.metrics import evaluate_stitching_metrics
-from sea_mosaic.types import GlobalTransforms, PairResult, ProcessStats, WarpedImages, WarpedMasks
-from sea_mosaic.warp import warp_images
+from sea_mosaic.metrics import compute_seam_error_streaming, evaluate_stitching_metrics
+from sea_mosaic.types import GlobalTransforms, PairResult, ProcessStats
+from sea_mosaic.warp import compute_canvas_size, warp_images_streaming
 
 # A homography has 8 degrees of freedom; 4 point correspondences (8 equations) is the
 # mathematical minimum needed to determine one uniquely. Below this threshold, the
@@ -156,21 +156,35 @@ def run_pipeline(
         placeholder = np.zeros_like(images[config.reference_index])
         return placeholder, metrics_df
 
-    # --- warp: filter non-finite transforms BEFORE canvas sizing, so one bad
-    # transform can't poison compute_canvas_size's shared bounding-box computation for
-    # every other image. A finite-but-degenerate transform (e.g. scale=0) never raises
-    # in cv2.warpPerspective -- it silently produces an all-black mask, already
-    # correctly excluded below by the "must have >=1 nonzero pixel" rule; no separate
-    # isolation mechanism is needed for that case.
+    # --- warp + classify + blend (streaming): filter non-finite transforms BEFORE
+    # canvas sizing, so one bad transform can't poison compute_canvas_size's shared
+    # bounding-box computation for every other image. A finite-but-degenerate transform
+    # (e.g. scale=0) never raises in cv2.warpPerspective -- it silently produces an
+    # all-black mask, already correctly excluded below by the "must have >=1 nonzero
+    # pixel" rule; no separate isolation mechanism is needed for that case.
+    #
+    # This used to be three separate passes over all N images (warp everything, THEN
+    # classify each by inspecting the fully materialized warped_masks dict, THEN blend
+    # only the survivors) -- each pass needing every image's canvas-sized warped data
+    # alive at once (O(N * canvas_size)). It is now one fused streaming pass:
+    # warp_images_streaming yields one image at a time, _successful_only classifies it
+    # immediately (discarding a failed image's warped arrays right there -- they are
+    # never yielded onward, never touch blend_images_streaming's accumulator, and are
+    # not stored anywhere else in this function either) and forwards only survivors into
+    # blend_images_streaming, which folds each one into its running accumulator and lets
+    # it be freed before the next arrives. Peak memory is O(canvas_size), not
+    # O(N * canvas_size) -- see CLAUDE.md's streaming-accumulator backlog item.
     usable_transforms = {
         index: transform
         for index, transform in global_transforms.transforms.items()
         if np.all(np.isfinite(transform))
     }
 
-    warped_images_by_index: dict[int, np.ndarray] = {}
-    warped_masks_by_index: dict[int, np.ndarray] = {}
     canvas_size = (0, 0)
+    successful_indices: set[int] = set()
+    mosaic = np.zeros((0, 0, 3), dtype=np.uint8)
+    seam_error_value = float(np.nan)
+
     if usable_transforms:
         usable_images = {index: images[index] for index in usable_transforms}
         usable_global_transforms = GlobalTransforms(
@@ -179,18 +193,44 @@ def run_pipeline(
             optimization_status=global_transforms.optimization_status,
             residual_error=global_transforms.residual_error,
         )
-        warped, masks = warp_images(usable_images, usable_global_transforms)
-        warped_images_by_index, warped_masks_by_index = warped.images, masks.masks
-        canvas_size = warped.canvas_size
+        usable_shapes = {index: image.shape[:2] for index, image in usable_images.items()}
+        canvas_size = compute_canvas_size(usable_shapes, usable_global_transforms)
 
-    successful_indices: set[int] = set()
-    for index in all_indices:
-        mask = warped_masks_by_index.get(index)
-        if mask is None or not np.any(mask > 0):
-            continue
-        has_anchor = config.gps_positions is not None and index in config.gps_positions
-        if index == config.reference_index or has_determined_edge(index) or has_anchor:
-            successful_indices.add(index)
+        # is-reference / has-determined-edge / has-anchor are all computable from
+        # pair_results/config alone, independent of any warped pixel data -- precomputed
+        # once here so the streaming loop below only has to check the ONE thing that
+        # genuinely requires the warped mask: whether it ended up non-empty.
+        structurally_qualifies = {
+            index: (
+                index == config.reference_index
+                or has_determined_edge(index)
+                or (config.gps_positions is not None and index in config.gps_positions)
+            )
+            for index in usable_transforms
+        }
+
+        def _successful_only(stream):
+            for index, warped_image, warped_mask in stream:
+                if structurally_qualifies[index] and np.any(warped_mask > 0):
+                    successful_indices.add(index)
+                    yield index, warped_image, warped_mask
+                # else: warped_image/warped_mask fall out of scope right here -- never
+                # yielded downstream, never entered into blend_images_streaming's
+                # accumulator, and this generator holds no history of past iterations.
+
+        warped_stream = warp_images_streaming(usable_images, usable_global_transforms, canvas_size)
+        mosaic = blend_images_streaming(_successful_only(warped_stream), canvas_size)
+
+        if successful_indices:
+            successful_images = {index: usable_images[index] for index in successful_indices}
+            seam_error_value = compute_seam_error_streaming(
+                successful_images, global_transforms, canvas_size
+            )
+        else:
+            # blend_images_streaming ran over an empty (fully-filtered-out) stream above,
+            # producing a canvas-sized all-zero mosaic -- not this function's documented
+            # "no successful images" contract, which is an empty (0, 0, 3) array.
+            mosaic = np.zeros((0, 0, 3), dtype=np.uint8)
 
     failed_indices = sorted(set(all_indices) - successful_indices)
     successful_image_count = len(successful_indices)
@@ -201,30 +241,6 @@ def run_pipeline(
         pipeline_status = "partial_success"
     else:
         pipeline_status = "failed"
-
-    blend_indices = sorted(successful_indices)
-    if blend_indices:
-        mosaic, seam_masks = blend_images(
-            WarpedImages(
-                images={i: warped_images_by_index[i] for i in blend_indices},
-                canvas_size=canvas_size,
-            ),
-            WarpedMasks(
-                masks={i: warped_masks_by_index[i] for i in blend_indices},
-                canvas_size=canvas_size,
-            ),
-        )
-        warped_images_result = WarpedImages(
-            images={i: warped_images_by_index[i] for i in blend_indices}, canvas_size=canvas_size
-        )
-        warped_masks_result = WarpedMasks(
-            masks={i: warped_masks_by_index[i] for i in blend_indices}, canvas_size=canvas_size
-        )
-    else:
-        mosaic = np.zeros((0, 0, 3), dtype=np.uint8)
-        seam_masks = {}
-        warped_images_result = None
-        warped_masks_result = None
 
     elapsed = time.perf_counter() - start_time
     process_stats = ProcessStats(
@@ -237,16 +253,20 @@ def run_pipeline(
         avg_processing_time_per_image_sec=elapsed / input_image_count,
     )
 
+    # warped_images/warped_masks/seam_masks are intentionally omitted here (defaulting to
+    # None inside evaluate_stitching_metrics, which returns seam_error=np.nan for that
+    # case) -- the streaming path never materializes those eager, all-N-canvas-sized
+    # structures at all. seam_error_value was already computed above via
+    # compute_seam_error_streaming, so it is patched into the one column that would
+    # otherwise be affected, immediately afterward.
     metrics_df = evaluate_stitching_metrics(
         pair_results=pair_results,
         global_transforms=global_transforms,
         image_shapes={i: images[i].shape[:2] for i in all_indices},
         process_stats=process_stats,
         method=matcher.name,
-        warped_images=warped_images_result,
-        warped_masks=warped_masks_result,
-        seam_masks=seam_masks or None,
         loops=config.loops,
     )
+    metrics_df["seam_error"] = seam_error_value
 
     return mosaic, metrics_df

@@ -346,6 +346,18 @@ def compute_seam_error_streaming(
     overlap, so this produces the exact same total (same contributing pairs, same order,
     same arithmetic) as compute_seam_error given the equivalent eagerly-warped input.
 
+    `images` may legitimately be a SUBSET of a larger warped set (e.g. only the images
+    that passed run_pipeline's success classification, matching compute_seam_error's own
+    historical behavior of only considering images that made it into the blend) without
+    needing the caller to also supply the full set's canvas origin: origin_offset here is
+    always a pure translation applied uniformly to every image being compared, so it
+    cannot change their relative alignment to each other, and a subset's own bounding
+    span is always contained within whatever larger span canvas_size was sized from --
+    so re-anchoring to the subset's own origin can never clip anything a full-set origin
+    wouldn't have. Verified empirically (not just derived): computing this with a
+    subset's own origin vs. an explicitly-supplied full-set origin gave the bit-identical
+    seam_error value.
+
     No seam_masks parameter: blend_images_streaming deliberately does not produce one (see
     its docstring), and docs/task2.md documents seam_masks as optional for the seam metric
     ("如果 pipeline 本身有 seam finder，請額外保留") -- this always falls back to the same

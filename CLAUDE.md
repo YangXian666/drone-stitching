@@ -635,9 +635,10 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   這是架構本身的問題，不是這批資料特有的；(2) 如果旋轉/scale 退化問題
   到 10 月依然存在，canvas 本身的失控成長會讓這個上限被提前撞上——把
   記憶體架構改成 O(canvas_size)（不再隨 N 成長，見下面「目前狀態」的
-  streaming accumulator 待辦，已有設計、尚未實作）解決的是問題 (1)，
-  不是問題 (2)；問題 (2) 仍然要靠旋轉/scale 退化本身被修好才能真正解決
-  （10 月重新評估），兩者要分開處理，修好其中一個不代表另一個就不用管了
+  streaming accumulator 待辦，已完成實作並接進 `run_pipeline`）解決的
+  是問題 (1)，不是問題 (2)；問題 (2) 仍然要靠旋轉/scale 退化本身被修好
+  才能真正解決（10 月重新評估），兩者要分開處理，修好其中一個不代表
+  另一個就不用管了
 - **`io_utils.py` 的 `load_image`/`load_images` 仍是 `...` 空殼**（沒有真的用
   PIL/cv2 讀圖、也沒有測試覆蓋），已經在兩個不同任務裡各撞到一次：
   第一次是 SIFT `match_pair` 對照實驗（0352 vs 0353 inlier_ratio 診斷），
@@ -648,6 +649,78 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   `warp.py`/`blend.py` 大機率也需要讀取真實影像像素，很可能會第三次撞到。
   已在下面「目前狀態」把 `load_image`/`load_images` 明確排入待辦，排在
   `warp.py` 之前。
+
+### streaming accumulator 記憶體重構回顧（總結）
+
+上面關於 canvas 超線性成長、cgroup 記憶體上限、streaming accumulator 設計與
+實作的記錄橫跨好幾條很長的條目，這裡整理成一個精簡的時間線摘要，方便之後
+快速回顧整件事的來龍去脈，不用重新讀完上面所有細節。
+
+1. **觸發原因**：50 張真實資料壓力測試被 OOM killer 殺掉。診斷發現這個 pod
+   的真實記憶體上限是 cgroup `memory.max=60GB`，不是 `free -h` 顯示的主機
+   總量（314GB）——`free -h` 看到的是整台共用主機的記憶體，跟這個 pod 實際
+   能用的量無關，會嚴重誤導記憶體判斷。**之後任何記憶體相關的診斷或容量
+   規劃都要看 `/sys/fs/cgroup/memory.current` 對照 `/sys/fs/cgroup/
+   memory.max`，不要再看 `free -h`**（見上面「環境」段落）。
+
+2. **根因**：`warp_images`/`blend_images` 把每張影像的全畫布尺寸陣列
+   （warped image、warped mask、distance-weight、seam mask）同時留在記憶體
+   裡，複雜度是 O(N × canvas_size)，不是 O(canvas_size)。而 canvas_size
+   本身又會因為已經記錄過的 pose-graph 旋轉/scale 退化問題超線性成長（見
+   上面「已知的限制」的 Effect A/B 診斷：canvas 面積從 N=2 的 55.1 Mpx 長到
+   N=50 的 293.0 Mpx，非單調、忽停滯忽暴衝）。**這是第一次量到這個既有
+   已知 bug 的記憶體代價，退化問題本身不是這次新發現的**——旋轉/scale
+   退化早就記錄在案，只是先前只知道它會造成幾何扭曲，沒意識到它還會拖垮
+   記憶體。
+
+3. **修法**：streaming accumulator 設計，分四階段實作，每階段都先寫等價性
+   （`np.array_equal`，不是近似相等）/laziness（call-counting proxy 證明
+   真正逐張處理，不是建好 list 再假裝 streaming）/gc（weakref 證明已處理過
+   的陣列沒有被暗中續留）/`tracemalloc` 平坦度（N=10 vs N=100 實測峰值比值
+   接近 1，不是接近 10）測試確認紅燈，再實作到綠燈，全程不允許既有測試
+   迴歸：
+   - `warp_images_streaming`（generator，逐張 yield，不一次 materialize
+     全部 N 張）
+   - `blend_images_streaming`（`weighted_sum`/`weight_sum` 兩個固定大小
+     累加陣列，單一 pass 折入即可丟棄，只回傳 mosaic 不回傳 `seam_masks`）
+   - `compute_seam_error_streaming`（bounding-box 預篩選候選對，把成本從
+     O(N²) 全對比較降到跟真正重疊的候選對數量相關，並正確處理 loop
+     closure——不假設只有序列相鄰的影像會重疊；對候選對隨需重新 warp，
+     一次只有 2 張影像的 canvas 尺寸資料存在）
+   - 三段最後整合進 `run_pipeline`：原本「warp 全部 N 張 → 分類 → 只
+     blend 通過的」三個分開的、都需要 N 張 canvas 尺寸資料同時存在的階段，
+     融合成一個 streaming pass，失敗影像的 warped 陣列在分類的當下就被
+     捨棄，不會進入 blend 的累加器；用 golden-fixture regression（3 個
+     既有合成情境，重構前後比對 mosaic + metrics_df）驗證整條 pipeline
+     輸出沒有改變。
+
+4. **過程中的技術細節**：`blend_images`（eager）在正規化 alpha 時會多一次
+   `.astype(float32)` 降精度，`blend_images_streaming` 全程 float64、最後
+   才除一次——兩者數學上等價但不保證逐位元組相等。這造成了一個**自然發生
+   （不是刻意構造）**的 1-ULP 舍入邊界差異：golden regression 測試裡單一
+   像素 `(row=50, col=27)`，3 個 channel 皆從 `[2,2,2]` 變成 `[3,3,3]`，
+   真值 ≈2.50000015，剛好落在 `.5` 邊界兩側。因為 streaming 是往後
+   `run_pipeline` 實際會用的路徑，這個 golden 基準已經重新捕捉以反映
+   streaming 版本的正確行為（另外兩個沒有踩到這個邊界的 golden 檔案維持
+   原樣，byte-for-byte 驗證過未被觸碰）。
+
+5. **新發現的獨立待辦**：驗證這次重構的端到端記憶體測試意外發現
+   `compose_global_transforms` 的 `scipy.optimize.least_squares` 求解器
+   本身有一個完全獨立、相當可觀的記憶體成本——N=100（合成資料，極小
+   canvas）時單獨佔 15,948KB，是同一次 `run_pipeline` 呼叫總 peak
+   （16,388KB）的 97%。懷疑根因是 Jacobian 矩陣用稠密（dense）方式建構，
+   大小隨 pose-graph 參數量（隨 N 成長）平方增長，但這只是懷疑，還沒有
+   像這次 streaming 重構一樣做過根因驗證。可能的修法方向是改用稀疏
+   （sparse）Jacobian——pose graph 天生稀疏，多數 node 只跟少數相鄰 node
+   有邊相連，一個 node 的殘差不會依賴大多數其他 node 的參數，理論上很適合
+   稀疏表示法，但這個方向也還沒有實際評估可行性。已排入待辦（見下面
+   「目前狀態」），但不是現在處理。
+
+6. **結論**：架構複雜度從 O(N × canvas_size) 降到 O(canvas_size)，理論上
+   不再受影像張數本身限制。**但這個結論只涵蓋 warp/blend/seam_error 三段，
+   不涵蓋 `compose_global_transforms`**——那一段的複雜度還沒有被驗證過，
+   10 月真正上大規模正式資料集之前，仍然需要對它做獨立的評估（可能還需要
+   一次跟這次規模相近的診斷+設計+TDD 實作流程）。
 
 ## 目前狀態
 - [x] SSH + VS Code Remote-SSH + Claude Code CLI 環境
@@ -849,24 +922,92 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     怎麼定、圖片本身要不要也是 `run_pipeline` 自動寫檔（目前
     `run_pipeline` 只回傳 `(mosaic, metrics_df)`，沒有寫任何檔案）,
     這些是新的、獨立的設計決定,不屬於「串接四段管線」這輪的範圍。
-  - [ ] warp.py/blend.py/pipeline.py: streaming accumulator 記憶體重構
-    （設計已完成，尚未實作）——把記憶體用量從 O(N × canvas_size) 降到
-    O(canvas_size)，不再隨影像數量 N 成長，見上面「已知的限制」canvas
-    超線性成長 + cgroup 記憶體診斷那兩條記錄，跟旋轉/scale 退化是同一條
-    診斷鏈但要分開處理：這個待辦解決的是「架構本身在資料量大時必然撞
-    記憶體上限」，不解決「canvas 本身為什麼會失控成長」（那個仍然暫緩到
-    10 月）。設計要點：(1) `blend_images` 的加權平均改成單一 pass 的
-    streaming accumulator（`weighted_sum`/`weight_sum` 兩個固定大小的
-    累加陣列，逐張影像折入後即可丟棄該影像的 canvas 尺寸暫存陣列，
-    數學上等價於現有「先正規化成 alpha 再加權平均」的兩階段做法）；
-    (2) 光改 blend_images 不夠，`warp_images` 目前的回傳型別（一次
-    materialize 全部 N 張 canvas 尺寸影像的 dict）本身就是 O(N×canvas)
-    的源頭之一，需要一併改成逐張產生而非一次全部回傳，兩個階段才能
-    真正合併成一個 O(canvas_size) 的 streaming pass；(3) 已發現一個
-    未解的阻塞點：`metrics.py` 的 `compute_seam_error` 對
-    `warped_images`/`warped_masks` 做 all-pairs（O(N²)）比對，需要同時
-    存取所有 N 張 canvas 尺寸影像，跟 streaming 設計直接衝突，在
-    streaming 版本真正實作前必須先決定怎麼處理（重新設計
-    `compute_seam_error` 本身、接受它保留自己的一份記憶體成本，還是用
-    bounding-box 預篩選 + 隨需重算），這個決定還沒有做
+  - [x] warp.py/blend.py/metrics.py/pipeline.py: streaming accumulator 記憶體
+    重構——把 `warp_images`/`blend_images`/`compute_seam_error` 的
+    O(N × canvas_size) 記憶體用量降到 O(canvas_size)，不再隨影像數量 N
+    成長，並接進 `run_pipeline` 取代舊的 eager 呼叫。分四階段、每階段
+    先寫等價性/laziness/gc/tracemalloc 平坦度測試確認紅燈（因為新函式
+    還不存在），再實作到綠燈，不允許既有測試迴歸：
+    - `warp.py`: `warp_images_streaming`（generator，逐張 yield
+      `(index, warped_image, warped_mask)`，canvas_size 由呼叫端用既有
+      `compute_canvas_size` 算好傳入，不新增攜帶 canvas_size 的類別）。
+      用 `cv2.warpPerspective` 的 call-counting proxy 證明真正逐張執行
+      （不是先建 list 再 `yield from`），用 weakref+gc 證明已 yield 過的
+      陣列沒有被任何隱藏快取續留。
+    - `blend.py`: `blend_images_streaming`（`weighted_sum`/`weight_sum`
+      兩個固定大小累加陣列，單一 pass 折入後即可丟棄每張影像的 canvas
+      尺寸暫存陣列，數學上等價於現有「先正規化成 alpha 再加權平均」的
+      兩階段做法，但只回傳 mosaic，不回傳 `seam_masks`——那是
+      `seam_masks` 唯一的消費者 `compute_seam_error` 需要的東西，per
+      docs/task2.md 本來就是可選欄位）。float64 除法結合律不保證逐位元組
+      相等（除的順序不同），但用 `tracemalloc` 實測 N=10 vs N=100 peak
+      比值 0.9993，記憶體確實打平。
+    - `metrics.py`: 新增 `_image_canvas_bbox`/`_bboxes_overlap`（bounding
+      box 預篩選候選對，edge-touching 採 inclusive 慣例，因為這個
+      filter 唯一的正確性要求是「不能漏掉真的重疊」，多篩進來的候選對
+      由既有 pixel-level overlap 檢查精確排除）+
+      `_candidate_overlapping_pairs`（成本從跟 N² 相關降到跟真正重疊的
+      候選對數量相關，同時正確處理 loop closure——不假設只有序列相鄰的
+      影像會重疊，已用真實案例驗證非相鄰但確實重疊的 pair 有被正確納入）
+      + `compute_seam_error_streaming`（對候選對隨需重新 warp，一次只有
+      2 張影像的 canvas 尺寸資料存在，用真實情境驗證過：對子集合計算時
+      不需要額外傳入完整集合的 canvas origin，因為 origin 只是均勻套用
+      在所有比較影像上的純平移，不會改變任兩張影像的相對比對結果，只要
+      canvas_size 夠大不會裁切即可——這點原本以為需要額外參數修正，
+      後來用實測推翻了這個假設，沒有加不必要的參數）。
+    - `pipeline.py`: `run_pipeline` 把原本「warp 全部 N 張 → 用完整
+      `warped_masks` dict 做成功/失敗分類 → 只 blend 分類通過的影像」
+      三個分開的、都需要 N 張 canvas 尺寸資料同時存在的階段，融合成一個
+      streaming pass：`warp_images_streaming` 逐張 yield，一個包著它的
+      filter generator（`_successful_only`）立刻對每張影像分類（
+      是否為 reference/有沒有 determined edge/有沒有 GPS anchor 這些
+      跟影像本身無關的判斷已經在迴圈外預先算好；只有「warped mask 是否
+      非空」這一項真正需要當下的 warp 結果），失敗的影像的 warped
+      陣列在那個當下就變成沒有任何引用、被捨棄，從來不會進入
+      `blend_images_streaming` 的累加器，也沒有被存到別的地方；只有
+      通過分類的才 yield 下去餵給 `blend_images_streaming`。
+      `compute_seam_error` 的呼叫改成 `compute_seam_error_streaming`，
+      結果 patch 進 `evaluate_stitching_metrics` 回傳的 `metrics_df`
+      的 `seam_error` 欄位（`evaluate_stitching_metrics` 本身簽名完全
+      不動，因為 `warped_images`/`warped_masks`/`seam_masks` 只有這
+      一個用途，這是全部四階段裡唯一沒有改動任何既有公開函式簽名的
+      設計）。用 golden-fixture regression（`tests/fixtures/
+      golden_pipeline/`，3 個既有合成情境在重構前先各自存一份
+      `mosaic.npy`+`metrics_df.pkl`，重構後比對）證明整條 pipeline
+      輸出不變。**其中一個 golden 檔案（`isolated_node_without_gps_
+      anchor`）重新捕捉過一次**：發現真實出現（不是刻意構造）的
+      one-ULP 舍入邊界差異——單一像素 `(row=50, col=27)`，3 個 channel
+      皆從 `[2,2,2]` 變成 `[3,3,3]`，真值 ≈2.50000015，兩種算法都對，
+      只是 `blend_images`（eager）在正規化 alpha 時有一次
+      `.astype(float32)` 降精度，`blend_images_streaming` 全程 float64、
+      最後才除一次，剛好在這個像素落在 `.5` 邊界兩側——因為 streaming
+      是往後 `run_pipeline` 實際會用的路徑，重新捕捉反映的是「未來正確
+      行為」，不是遮蓋迴歸，`np.array_equal` 逐位元組相等的比對標準
+      維持不變，只換了這一個 golden 檔案內容，另外兩個 golden 檔案
+      （byte-for-byte 驗證過未被觸碰）維持原樣。
+  - [ ] **新發現的獨立待辦（不屬於上面 streaming accumulator 重構的
+    範圍，優先程度尚未排定）：`compose_global_transforms` 的
+    pose-graph 求解器本身有一個相當可觀、完全獨立的記憶體成本**，是在
+    驗證上面 streaming 重構的端到端記憶體測試時意外發現的——實測
+    N=100（合成資料，極小 canvas）時，`compose_global_transforms`
+    單獨的 `tracemalloc` peak 是 15,948KB，占同一次 `run_pipeline`
+    呼叫總 peak（16,388KB）的 97%，換句話說：即使
+    `warp_images_streaming`/`blend_images_streaming`/
+    `compute_seam_error_streaming` 已經把它們自己負責的部分修好（同樣
+    情境下單獨量測，N=10→N=100 只從 285.5KB 漲到 544.5KB，比值
+    ≈1.91x，接近打平），`run_pipeline` 整體的記憶體用量還是會隨 N
+    劇烈成長，因為 compose 階段本身完全沒被這次重構碰過。懷疑根因是
+    `optimize_pose_graph` 用 `scipy.optimize.least_squares` 求解時
+    建構的 Jacobian 矩陣是稠密（dense）的，其大小隨 pose-graph 的參數
+    數量（每個 node 6 個自由度）與殘差數量（跟邊數+anchor 數成正比，
+    都跟著 N 成長）而增長，兩者相乘可能是 O(N²) 的來源——但這只是懷疑，
+    還沒有像 streaming 重構那樣實際做過根因驗證（例如拆開量測純
+    Jacobian 建構跟其他步驟各自的貢獻）。**這個待辦的存在本身要被看見，
+    不能因為驗證 streaming 重構的記憶體測試把 `compose_global_transforms`
+    mock 掉、縮小驗證範圍後，這個發現就悄悄消失**——`tests/test_pipeline.py`
+    的 `test_run_pipeline_warp_blend_seam_error_peak_memory_is_flat_
+    not_linear_in_n`（名稱與 docstring 都已明確標註只驗證 warp/blend/
+    seam_error 三段，不涵蓋 compose_global_transforms）就是為了這個
+    範圍收斂而存在，不代表 `run_pipeline` 整體的記憶體用量已經被證明
+    打平
 - [ ] FastAPI

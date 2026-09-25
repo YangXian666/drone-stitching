@@ -16,6 +16,9 @@ content or SIFT is involved anywhere in this file.
 
 from __future__ import annotations
 
+import pickle
+import tracemalloc
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -204,8 +207,18 @@ def test_run_pipeline_only_reference_survives_is_failed() -> None:
 
 def test_run_pipeline_not_converged_compose_forces_failed_and_skips_warp_blend() -> None:
     """optimize_pose_graph's own not_converged status must not be trusted downstream --
-    run_pipeline treats it as a whole-run failure and must not call warp_images/
-    blend_images at all on a GlobalTransforms the optimizer itself doesn't believe in."""
+    run_pipeline treats it as a whole-run failure and must not call warp_images_streaming/
+    blend_images_streaming at all on a GlobalTransforms the optimizer itself doesn't
+    believe in.
+
+    Patch targets updated from warp_images/blend_images to their streaming replacements
+    when run_pipeline was wired to call the streaming accumulator path (see CLAUDE.md's
+    streaming-accumulator backlog item) -- same test name, same assertions, same intent;
+    only the two patch-target strings changed, tracking what run_pipeline actually calls
+    now. Deliberately not left pointing at the old (no longer called) names: doing so
+    would have made mock_warp.call_count == 0 trivially true regardless of whether
+    run_pipeline's not-converged guard worked at all, since neither old name is on the
+    execution path anymore -- a silently gutted, always-green assertion, not a real one."""
     images = {i: _tagged_image(i) for i in range(2)}
     matcher = _ScriptedMatcher({(0, 1): _good_match_result()})
 
@@ -217,8 +230,8 @@ def test_run_pipeline_not_converged_compose_forces_failed_and_skips_warp_blend()
     )
 
     with patch("sea_mosaic.pipeline.compose_global_transforms", return_value=not_converged):
-        with patch("sea_mosaic.pipeline.warp_images") as mock_warp:
-            with patch("sea_mosaic.pipeline.blend_images") as mock_blend:
+        with patch("sea_mosaic.pipeline.warp_images_streaming") as mock_warp:
+            with patch("sea_mosaic.pipeline.blend_images_streaming") as mock_blend:
                 _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
 
     assert metrics_df["pipeline_status"][0] == "failed"
@@ -378,3 +391,186 @@ def test_run_pipeline_without_gimbal_yaw_degrades_gracefully() -> None:
     _mosaic, metrics_df = run_pipeline(images, matcher, config)
 
     assert metrics_df["pipeline_status"][0] == "success"
+
+
+# --- F: streaming-accumulator integration regression (golden fixtures) ------------------
+#
+# These compare run_pipeline's output against fixtures captured from run_pipeline BEFORE
+# the streaming refactor (tests/fixtures/golden_pipeline/capture_golden.py) -- they only
+# ever READ those committed golden files, never regenerate them (an auto-regenerating
+# "golden" would silently launder a real regression into a new baseline instead of
+# catching it). Unlike the equivalence tests in stages 1-3 of this same redesign, these
+# are expected to PASS right now, before any pipeline.py change: they're regression
+# scaffolding, not a red-first check for a not-yet-written function -- their job starts
+# once pipeline.py's internals actually change.
+
+_GOLDEN_DIR = Path(__file__).resolve().parent / "fixtures" / "golden_pipeline"
+_TIMING_COLUMNS = {"total_processing_time_sec", "avg_processing_time_per_image_sec"}
+
+
+def _load_golden(name: str) -> tuple[np.ndarray, pd.DataFrame]:
+    mosaic = np.load(_GOLDEN_DIR / f"{name}.npy")
+    with open(_GOLDEN_DIR / f"{name}_metrics.pkl", "rb") as f:
+        metrics_df = pickle.load(f)
+    return mosaic, metrics_df
+
+
+def _assert_metrics_df_matches_golden(new_df: pd.DataFrame, golden_df: pd.DataFrame) -> None:
+    """Excludes wall-clock timing columns (legitimately different every run, not a
+    regression signal). Everything else is asserted with a tight rtol rather than bare
+    == -- not because any column is expected to need it (none of reprojection_error_px/
+    inlier_ratio/inlier_count/cycle_loop_error_px/distortion derive from blended pixel
+    values at all, and seam_error was proven bit-exact, not tolerance-based, in the
+    compute_seam_error_streaming equivalence tests) but as a documented safety margin; a
+    genuine mismatch here needs investigating as a real difference, not silently
+    loosened further."""
+    assert list(new_df.columns) == list(golden_df.columns)
+    for col in new_df.columns:
+        if col in _TIMING_COLUMNS:
+            continue
+        new_val, golden_val = new_df[col][0], golden_df[col][0]
+        if isinstance(golden_val, float) and np.isnan(golden_val):
+            assert isinstance(new_val, float) and np.isnan(new_val), f"{col}: expected NaN, got {new_val!r}"
+        elif isinstance(golden_val, list):
+            assert new_val == golden_val, f"{col}: {new_val!r} != {golden_val!r}"
+        elif isinstance(golden_val, float):
+            assert new_val == pytest.approx(golden_val, rel=1e-9, abs=1e-12), (
+                f"{col}: {new_val!r} != {golden_val!r}"
+            )
+        else:
+            assert new_val == golden_val, f"{col}: {new_val!r} != {golden_val!r}"
+
+
+def test_run_pipeline_matches_golden_all_images_well_matched() -> None:
+    images = {i: _tagged_image(i) for i in range(3)}
+    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    golden_mosaic, golden_metrics = _load_golden("all_images_well_matched")
+
+    mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+
+    assert np.array_equal(mosaic, golden_mosaic)
+    _assert_metrics_df_matches_golden(metrics_df, golden_metrics)
+
+
+def test_run_pipeline_matches_golden_isolated_node_without_gps_anchor() -> None:
+    """Exercises the classification path (edge/anchor-based) that has to move from a
+    post-hoc filter over a fully materialized warped_masks dict into an inline filter
+    over the warp stream -- the part of this integration that's more than a rename."""
+    images, matcher = _isolated_node_scenario()
+    golden_mosaic, golden_metrics = _load_golden("isolated_node_without_gps_anchor")
+
+    mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+
+    assert np.array_equal(mosaic, golden_mosaic)
+    _assert_metrics_df_matches_golden(metrics_df, golden_metrics)
+
+
+def test_run_pipeline_matches_golden_nonfinite_transform_isolated() -> None:
+    """Exercises the pre-warp finite-transform filter combined with mask-emptiness
+    classification -- distinct from the edge/anchor-based classification above."""
+    images = {0: _tagged_image(0, size=5), 1: _tagged_image(1, size=5), 2: _tagged_image(2, size=5)}
+    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    nan_transform = np.array([[np.nan, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    poisoned = GlobalTransforms(
+        transforms={
+            0: np.eye(3),
+            1: nan_transform,
+            2: np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+        },
+        reference_index=0, optimization_status="converged", residual_error=0.1,
+    )
+    golden_mosaic, golden_metrics = _load_golden("nonfinite_transform_isolated")
+
+    with patch("sea_mosaic.pipeline.compose_global_transforms", return_value=poisoned):
+        mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+
+    assert np.array_equal(mosaic, golden_mosaic)
+    _assert_metrics_df_matches_golden(metrics_df, golden_metrics)
+
+
+# --- G: warp/blend/seam_error memory scaling (NOT all of run_pipeline -- see the test's
+# own docstring for why compose_global_transforms is deliberately mocked out) -----------
+
+
+def _synthetic_pipeline_scenario(
+    n: int, total_span: float = 200.0, image_height: int = 10
+) -> tuple[dict[int, np.ndarray], _ScriptedMatcher]:
+    """n images along a FIXED-length span (image width shrinks as n grows, same lesson
+    as the compute_seam_error_streaming fixture in stage 3) so canvas_size stays roughly
+    constant as n grows -- empirically verified against the REAL compose_global_transforms
+    (not assumed, since run_pipeline runs real pose-graph optimization, not a hand-fed
+    GlobalTransforms): mosaic.shape was IDENTICAL, (11, 201, 3), at both n=10 and n=100.
+    Sequential MatchResults (_good_match_result(tx=step, ty=0)) give consistent pairwise
+    translations regardless of the tiny image dimensions -- findHomography works on the
+    raw point correspondences, not on whether they fall within the image's own bounds."""
+    step = total_span / n
+    image_width = max(2, int(round(step * 2)))
+    images = {
+        i: np.full((image_height, image_width, 3), (i % 200) + 1, dtype=np.uint8) for i in range(n)
+    }
+    matcher = _ScriptedMatcher(
+        {(i, i + 1): _good_match_result(tx=step, ty=0.0) for i in range(n - 1)}
+    )
+    return images, matcher
+
+
+def _hand_fed_global_transforms(n: int, total_span: float = 200.0) -> GlobalTransforms:
+    """A cheap, non-optimized GlobalTransforms matching _synthetic_pipeline_scenario's own
+    geometry exactly (translation by i*step), for mocking sea_mosaic.pipeline.
+    compose_global_transforms in the memory-scaling test below. See that test's docstring
+    for why: compose_global_transforms's real pose-graph solver has its own, separate,
+    O(N)-ish-or-worse memory cost (see CLAUDE.md's dedicated backlog item) that has
+    nothing to do with warp_images_streaming/blend_images_streaming/
+    compute_seam_error_streaming -- this mock isolates exactly the three stages this
+    integration is actually responsible for."""
+    step = total_span / n
+    return GlobalTransforms(
+        transforms={i: np.array([[1.0, 0.0, i * step], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]) for i in range(n)},
+        reference_index=0, optimization_status="converged", residual_error=0.0,
+    )
+
+
+def _peak_traced_bytes_for_pipeline(n: int) -> int:
+    images, matcher = _synthetic_pipeline_scenario(n)
+    gt = _hand_fed_global_transforms(n)
+    tracemalloc.start()
+    try:
+        tracemalloc.clear_traces()
+        with patch("sea_mosaic.pipeline.compose_global_transforms", return_value=gt):
+            run_pipeline(images, matcher, _base_config())
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak
+
+
+def test_run_pipeline_warp_blend_seam_error_peak_memory_is_flat_not_linear_in_n() -> None:
+    """Scope note (renamed from an earlier "end_to_end" name specifically to prevent this
+    misreading): this test verifies ONLY warp_images_streaming/blend_images_streaming/
+    compute_seam_error_streaming's memory behavior through run_pipeline's real
+    orchestration -- it does NOT cover run_pipeline's memory behavior as a whole.
+    compose_global_transforms is mocked out (see _hand_fed_global_transforms) because its
+    real pose-graph solver has a separate, much larger, and entirely independent memory
+    cost that was never in scope for this streaming-accumulator redesign: measured
+    directly, compose_global_transforms alone accounted for 15,948KB of a 16,388KB total
+    peak at n=100 (97%) when left real -- see CLAUDE.md's dedicated backlog item for that
+    finding, which is NOT considered fixed or covered by this test passing.
+
+    With compose_global_transforms isolated out, this is the actual acceptance criterion
+    for the three streaming stages this redesign covers, measured through the real public
+    entry point, not just the lower-level functions in isolation. Deliberately verified
+    (via `git stash` of pipeline.py, not guessed) to fail against the PRE-refactor
+    run_pipeline with this exact same compose mock already in place: peak_10=546548
+    bytes, peak_100=2831789 bytes (ratio ~5.18x, fails the <2.0 bound below) using
+    warp_images/blend_images/eager compute_seam_error's all-pairs O(N^2) call --
+    confirming the compose mock alone does not trivially pass this test, only the actual
+    streaming wiring does."""
+    peak_10 = _peak_traced_bytes_for_pipeline(10)
+    peak_100 = _peak_traced_bytes_for_pipeline(100)
+
+    ratio = peak_100 / peak_10
+    assert ratio < 2.0, (
+        f"peak traced memory scaled {ratio:.2f}x going from N=10 to N=100 "
+        f"(peak_10={peak_10} bytes, peak_100={peak_100} bytes) -- expected roughly flat, "
+        f"not O(N)"
+    )
