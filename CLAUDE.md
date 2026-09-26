@@ -1206,10 +1206,18 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
       真實資料上的準確度（對照 GimbalYawDegree）只留在診斷腳本，不進正式測試。
       代價：新的高 inlier 測試要 36 秒（兩個方向各一次約 19 萬×19 萬 descriptor 的
       BF kNN），全套測試從約 10 秒變成約 50 秒
-    - [ ] Stage B: `gps_placement.py`——北向上像素座標系的影像中心位置
-      （`x = ppm·E`、`y = −ppm·N`，不含旋轉）＋ 從資料自估 `pixels_per_meter`
-      ＋ 只接受 EXIF 來源經緯度的薄包裝（XMP 來源視同沒有 GPS）。測試規劃
-      B1～B8、P1～P5、E1
+    - [x] Stage B: `gps_placement.py`——`place_by_gps`（北向上像素座標系的影像中心
+      位置，`x = ppm·E`、`y = −ppm·N`，不含旋轉；沒有可用 GPS 的 node 明確列進
+      `unlocated`）＋ `estimate_pixels_per_meter`（各邊「dst 中心在 src 像素座標裡的
+      位移 ÷ GPS 位移」的中位數，排除短於 `MIN_GPS_DISPLACEMENT_M = 5.0` 的邊）＋
+      `load_exif_latlons`（XMP 來源經緯度視同沒有 GPS），`io_utils` 新增
+      `load_latlon_with_source` 回報經緯度來源（`load_gps_position` 本身沒改）。
+      新增 36 條測試（`tests/test_gps_placement.py` 33 條、`tests/test_io_utils.py`
+      3 條），共用的合成針孔相機放在 `tests/synthetic_camera.py`，224/224 全專案
+      綠燈。mutation 檢查：鏡射（North→+y）、接受 XMP 經緯度、拿掉距離閾值、
+      不回報 unlocated、中位數改平均，各被至少一條測試抓到；`H` 換成 `inv(H)` 起初
+      沒被抓到——對同尺度的剛體變換兩者的位移長度精確相等——補了一條不同高度的
+      合成相機測試，鎖住「用 src 像素單位」的合約（期望 `f / src 高度`）
     - [x] Stage B/C 共用：最小 GPS 位移閾值定案為 5 m（模型推導的內插值，10 月
       要用新資料重新驗證），見「最小 GPS 位移閾值與 Stage C 漂移發現」
     - [ ] Stage C: 用 GPS 航跡方位角把 Stage A 的 gauge 對齊到北向上座標系（δ），

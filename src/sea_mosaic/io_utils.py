@@ -120,6 +120,32 @@ def load_gps_position(path: Path) -> np.ndarray | None:
     return np.array([lat, lon, abs_alt, rel_alt], dtype=np.float64)
 
 
+def load_latlon_with_source(path: Path) -> tuple[float, float, str] | None:
+    """Return (lat_deg, lon_deg, source), where source is "exif" or "xmp", or None if the
+    image has no GPS fix at all.
+
+    Same precedence as load_gps_position (EXIF GPS IFD first, DJI XMP drone-dji fields
+    as fallback), but the source is reported so callers bound by CLAUDE.md's
+    最小可行版本範圍決定 (no DJI-specific metadata) can refuse XMP-sourced coordinates
+    instead of silently depending on them.
+    """
+    exif_gps = _read_exif_gps(path)
+    if exif_gps is not None:
+        raw_lat, raw_lon = exif_gps.get("GPSLatitude"), exif_gps.get("GPSLongitude")
+        lat_ref, lon_ref = exif_gps.get("GPSLatitudeRef"), exif_gps.get("GPSLongitudeRef")
+        if None not in (raw_lat, raw_lon, lat_ref, lon_ref):
+            lat = _exif_dms_to_decimal_degrees(_to_dms_tuple(raw_lat), lat_ref)
+            lon = _exif_dms_to_decimal_degrees(_to_dms_tuple(raw_lon), lon_ref)
+            return lat, lon, "exif"
+
+    xmp_fields = _read_xmp_drone_dji_fields(path)
+    xmp_lat, xmp_lon = xmp_fields.get("GpsLatitude"), xmp_fields.get("GpsLongitude")
+    if xmp_lat is not None and xmp_lon is not None:
+        return _xmp_signed_decimal(xmp_lat), _xmp_signed_decimal(xmp_lon), "xmp"
+
+    return None
+
+
 def load_gimbal_yaw(path: Path) -> float | None:
     """Extract GimbalYawDegree from the embedded XMP drone-dji metadata; None if the XMP
     packet has no such attribute at all (e.g. no XMP packet, or one without gimbal

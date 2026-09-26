@@ -13,6 +13,7 @@ from sea_mosaic.io_utils import (
     _xmp_signed_decimal,
     load_gimbal_yaw,
     load_gps_position,
+    load_latlon_with_source,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "dji_smoke"
@@ -112,6 +113,35 @@ def test_load_gps_position_no_gps_returns_none():
     result = load_gps_position(FIXTURES / "no_gps.jpg")
 
     assert result is None
+
+
+# --- load_latlon_with_source: reports whether lat/lon came from EXIF or DJI XMP --------
+# Stage B must refuse XMP-sourced lat/lon (CLAUDE.md's 最小可行版本範圍決定), so the
+# source must be observable. Expected coordinates reuse the hard-coded values above.
+
+
+def test_load_latlon_with_source_real_exif_file_reports_exif():
+    result = load_latlon_with_source(FIXTURES / "DJI_20230127131426_0352_W.JPG")
+
+    assert result is not None
+    lat, lon, source = result
+    assert lat == pytest.approx(36.4277901, abs=1e-6)
+    assert lon == pytest.approx(-5.1262460, abs=1e-6)
+    assert source == "exif"
+
+
+def test_load_latlon_with_source_xmp_only_file_reports_xmp():
+    result = load_latlon_with_source(FIXTURES / "exif_stripped_xmp_only.jpg")
+
+    assert result is not None
+    lat, lon, source = result
+    assert lat == pytest.approx(36.4277901, abs=1e-6)
+    assert lon == pytest.approx(-5.1262460, abs=1e-6)
+    assert source == "xmp"
+
+
+def test_load_latlon_with_source_no_gps_returns_none():
+    assert load_latlon_with_source(FIXTURES / "no_gps.jpg") is None
 
 
 # --- load_gimbal_yaw: XMP-only (no EXIF equivalent for gimbal attitude) ----------------
