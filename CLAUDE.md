@@ -780,14 +780,20 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   - **Stage D：有界小幅精修**——從前三步的乾淨初始解出發，把 edge 殘差、
     弱權重 GPSAnchor、YawAnchor 放進同一個目標函數，修正量要有界（例如 scale
     ±10～20%）。
+  - **⚠️ 2026-09-26 範圍調整**：最小可行版本完全不用 GimbalYawDegree 或任何 DJI
+    專屬 XMP 欄位，Stage B/C/D 的內容跟著改了（Stage B 不用飛行高度、Stage C 改用
+    GPS 航跡方位角、Stage D 不含 YawAnchor）。見「最小可行版本範圍決定：不使用
+    DJI 專屬 metadata」。上面這幾行保留作為原始設計紀錄。
 - **Stage A 的設計決定（已定案）**：
   1. **譜方法**（每個 node 一個單位複數，組 Hermitian 矩陣取主特徵向量，再把
-     每個分量正規化成單位長度），不用 chordal `least_squares`。理由：不需要初始
+     每個分量正規化成單位長度；**後來改成 connection Laplacian `D − W` 的最小
+     特徵向量**，見「Stage A：特徵向量下溢 bug 與 loop closure 診斷」），不用 chordal `least_squares`。理由：不需要初始
      值（閉式解）、參數化裡沒有 scale 自由度、能真正利用蛇形資料的跨航線 loop。
      **連通分量檢查是必要防護**：先切出連通分量、各自求解並標記出來；圖不連通時
      各分量的相位互相無關，不能靜默產出垃圾結果。
   2. **yaw 完全不進 Stage A**，函式簽名裡不出現 yaw。GimbalYawDegree 只在
-     Stage C（對齊）與 Stage D（YawAnchor）出現。這也保留了一條不依賴 DJI 專屬
+     Stage C（對齊）與 Stage D（YawAnchor）出現（**已被範圍調整取代**：最小可行
+     版本的 Stage A～D 全部不用 GimbalYawDegree）。這也保留了一條不依賴 DJI 專屬
      XMP 欄位的旋轉路徑（呼應「YawAnchor 依賴風險」待辦）。
   3. **新模組 `src/sea_mosaic/rotation_averaging.py`**，不塞進 `posegraph.py`，
      輸入只需要 `(src, dst, θ_ab, weight)`。
@@ -929,6 +935,68 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
     約 ±2°（呼應「YawAnchor 依賴風險」待辦）。
   - **系統性偏差的根因還沒確認**，已列成獨立待辦（見「目前狀態」）：鏡頭畸變沒有
     校正，vs 透視項 g 方向一致、中心 Jacobian 只消掉一部分。
+
+### 最小可行版本範圍決定：不使用 DJI 專屬 metadata（2026-09-26）
+
+- **決定**：Stage A～D 的最小可行版本只用三種輸入：GPS 經緯度（EXIF）、影像本身
+  （SIFT+RANSAC homography），以及從經緯度序列算出來的衍生量（例如 GPS 航跡
+  方位角）。**完全不用 GimbalYawDegree，也不用任何 DJI 專屬 XMP 欄位**
+  （包括 `RelativeAltitude`、`AbsoluteAltitude`、`GpsLatitude`/`GpsLongitude`）。
+- **理由**：先驗證不依賴 DJI metadata 也能得到堪用的結果。10 月換機型時，核心
+  流程不會因為缺少專屬欄位而失效（呼應「YawAnchor 依賴風險」待辦）。
+  GimbalYawDegree 之後可以當獨立的加分項或精修來源，但不是這次的必要輸入。
+- **邊界的範圍**：不只是「計算公式裡不出現」。整個 Stage A～D 的設計、正式測試的
+  期望值、閾值的選擇，都不能碰這些欄位，哪怕只是拿來當旁證或交叉驗證。允許的
+  例外只有兩個：
+  1. 過去用 GimbalYawDegree 做過的驗證（例如「GPS 航跡方位角 vs 影像內前進方向」
+     跟 gimbal yaw 差一個約 1.8° 的常數），繼續留在 CLAUDE.md 當「這個方法可信」
+     的佐證，但正式測試不依賴它。
+  2. 最小可行版本真的跑出結果之後，可以私下拿 GimbalYawDegree 對照一次準確度，
+     當診斷，不進正式邏輯與正式測試。
+- **這個決定定下的 Stage B/C 設計**：
+  - **Stage B 只輸出影像中心位置**，放在北向上的像素座標系：`x = ppm·E`、
+    `y = −ppm·N`（y 取負號是影像 y 軸朝下的正確換算，跟鏡射 bug 相反）。不含任何
+    旋轉，也不依賴 Stage A。原本的想法是「ψ 換成 Stage A 的輸出」，但做不到：
+    Stage A 的角度 gauge 任意，要把 GPS 放進 Stage A 的座標系，必須先知道 gauge
+    跟正北差多少（δ），而 δ 正是 Stage C 的輸出，會變成循環依賴。
+  - **anchor 綁影像中心的公式移到 Stage C**：`t_i = p_i − R(φ_i)·c`，其中
+    `φ_i = θ_i + δ` 是絕對旋轉，要等 Stage C 求出 δ 才有。
+  - **Stage C 用 GPS 航跡方位角求 δ**：對每條兩端都有 GPS 和 Stage A 角度的邊，
+    `β_ij = angle(p_j − p_i)`（北向上像素座標系裡的 GPS 位移方向）、
+    `α_ij = angle(inv(H)·c − c)`（src 影像座標系裡量到的前進方向），
+    `δ_ij = β_ij − α_ij − θ_i`，δ 取加權圓周平均（複數相加，沒有 wraparound），
+    每個連通分量各算一個。推導出的性質：在北向上像素座標系裡（y 朝下），影像
+    pose 的旋轉角等於相機羅盤方位角，可以當合成測試的獨立期望值。
+  - **比例尺改成從資料自估**：`pixels_per_meter` 取各邊「homography 量到的中心
+    位移（px）÷ GPS 位移（m）」的中位數，不需要高度也不需要 DFOV。**為什麼不用
+    高度**：EXIF 標準欄位 `GPSAltitude` 讀到 150.0 m（WGS-84，跟 XMP 的
+    `AbsoluteAltitude` 相同），`RelativeAltitude`（XMP）是 100 m，這就是上面記錄的
+    「約 50 m 落差」。先前驗證 1 支持 100 m（homography 位移預測誤差中位數約 16 px），
+    用 150 m 會讓比例尺錯約 1/3；而 100 m 屬於 DJI XMP，不能用。
+  - **Stage D 最小可行版本不含 YawAnchor**。
+- **核對邊界時查出的三個牴觸，以及處理方式**：
+  1. **Stage A 已 commit 的 `test_real_pair_rotation_matches_gimbal_yaw_difference`**
+     的期望值就是 GimbalYawDegree 差值（−62.2°）。處理：換成 `θ_ab ≈ −θ_ba`
+     正反配對一致性測試（容差 0.5°），只驗證一致性、不驗證準確度；真實資料上的
+     準確度改成明確標記的診斷腳本，不進正式測試套件。
+  2. **原本規劃的 E2**（拿資料自估的 ppm 跟 DFOV＋100 m 算出的 28.70 比）：100 m 是
+     `RelativeAltitude`，屬於 DJI XMP。處理：排除。**真實資料上 ppm 的準確度沒有
+     符合邊界的獨立真值可以驗證**，方法的數學正確性只靠合成測試負責（P1、P2、P4，
+     加上針孔相機解析真值的 P5），真實資料改成只驗證「完全不依賴 XMP」（E1：剝除
+     XMP 的副本跟原檔結果逐位相同）。
+  3. **閾值不能用 gimbal 對照量出的數字定**：之前的「常數偏移約 1.8°、每條邊雜訊約
+     ±2°」來自 gimbal 對照。處理：最小 GPS 位移閾值改用資料內部一致性決定——先跑
+     診斷，看各邊估出的 ppm 比值和 δ_ij 的離散程度怎麼隨 GPS 位移長度變化，看過
+     實際分佈、確認有道理的切點後才寫進這裡定案，不憑感覺抓數字。**尚未定案。**
+- **`load_gps_position` 退回讀 XMP 經緯度的路徑**：它是 EXIF 優先，但 EXIF 缺經緯度
+  時會退回讀 XMP 的 `GpsLatitude`/`GpsLongitude`，而且高度優先讀 XMP 的
+  `AbsoluteAltitude`。這批 52 張都有 EXIF 經緯度，不會走到退回路徑，但未來如果遇到
+  「只有 XMP」的影像，Stage B 會悄悄依賴 DJI 欄位。**決定：Stage B 明確拒絕這個
+  路徑**。評估過複雜度：加一個薄包裝函式，用既有的 `_read_exif_gps`/
+  `_read_xmp_drone_dji_fields` 回報經緯度與來源（`"exif"` 或 `"xmp"`），
+  `load_gps_position` 本身和它既有的 io 測試都不用改，而且既有的 fixture
+  `exif_stripped_xmp_only.jpg` 剛好能測 `"xmp"` 的情況。Stage B 遇到來源是 XMP 的
+  經緯度，當成沒有 GPS（放進 `unlocated`）。
 
 ### streaming accumulator 記憶體重構回顧（總結）
 
@@ -1074,11 +1142,20 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
       自由度（對照舊的 `(a,b)` 純旋轉鏈 Check A：角度 0.6～6.6°、scale 崩到
       0.13～0.57）。`D − W` 取代 plain W 的完整經過，以及 52 張 loop closure 診斷，
       見「已知的限制」的「Stage A：特徵向量下溢 bug 與 loop closure 診斷」
-    - [ ] Stage B: GPS 直接擺放（修正 anchor 框架：y=−N、依參考影像 yaw 旋轉、
-      anchor 綁影像中心）
-    - [ ] Stage C: Stage A 旋轉對齊到 Stage B 座標系（全域旋轉偏移）
-    - [ ] Stage D: 有界小幅精修（edge + 弱 GPSAnchor + YawAnchor），接回
-      `compose_global_transforms`
+    - [ ] Stage A 補正：把違反範圍邊界的
+      `test_real_pair_rotation_matches_gimbal_yaw_difference` 換成 `θ_ab ≈ −θ_ba`
+      正反配對一致性測試（容差 0.5°）；真實資料準確度改成診斷腳本
+    - [ ] Stage B: `gps_placement.py`——北向上像素座標系的影像中心位置
+      （`x = ppm·E`、`y = −ppm·N`，不含旋轉）＋ 從資料自估 `pixels_per_meter`
+      ＋ 只接受 EXIF 來源經緯度的薄包裝（XMP 來源視同沒有 GPS）。測試規劃
+      B1～B8、P1～P5、E1
+    - [ ] Stage B/C 共用：最小 GPS 位移閾值，先跑資料內部一致性診斷再定案
+    - [ ] Stage C: 用 GPS 航跡方位角把 Stage A 的 gauge 對齊到北向上座標系（δ），
+      組成最終 pose（anchor 綁影像中心）。測試規劃 C1～C11
+    - [ ] Stage D: 有界小幅精修（edge + 弱 GPSAnchor；最小可行版本不含
+      YawAnchor），接回 `compose_global_transforms`
+    - [ ] 最小可行版本完成後：私下拿 GimbalYawDegree 對照準確度（診斷，不進
+      正式邏輯與測試）
     - [ ] 之後：跨航線配對（蛇形資料的 loop closure）、LoRetta 等 matcher 比較實驗
     - [ ] 旋轉系統性偏差的根因（每條同航線邊約 +0.3°，沿航線累積，loop 抓不到，
       見「已知的限制」的「Stage A：特徵向量下溢 bug 與 loop closure 診斷」）——
