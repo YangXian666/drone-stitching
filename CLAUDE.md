@@ -1220,8 +1220,25 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
       合成相機測試，鎖住「用 src 像素單位」的合約（期望 `f / src 高度`）
     - [x] Stage B/C 共用：最小 GPS 位移閾值定案為 5 m（模型推導的內插值，10 月
       要用新資料重新驗證），見「最小 GPS 位移閾值與 Stage C 漂移發現」
-    - [ ] Stage C: 用 GPS 航跡方位角把 Stage A 的 gauge 對齊到北向上座標系（δ），
-      組成最終 pose（anchor 綁影像中心）。測試規劃 C1～C11
+    - [x] Stage C: `frame_alignment.py` 的 `align_to_gps_frame`——每條可用邊
+      `δ_ij = β_ij − α_ij − θ_i`，每個 Stage A 連通分量取加權圓周平均得到一個 δ
+      （邊權重由呼叫端提供），`φ_i = θ_i + δ`，pose 綁影像中心
+      `t_i = p_i − R(φ_i)·c`、scale 1。只有位置和朝向都已知的 node 才有 pose；
+      `unlocated`（有角度沒 GPS）、`unoriented`（有 GPS 沒角度）、
+      `unaligned_components`（沒有可用邊的分量）明確列出。17 條新測試
+      （`tests/test_frame_alignment.py`，含合成蛇形三航線 A+B+C 端到端、真實 fixture
+      剝除 XMP 前後逐位相同），241/241 全專案綠燈（全套約 60 秒）。mutation 檢查
+      9 項全部被抓到：θ 正負號、`H` 換 `inv(H)`、anchor 綁左上角、方位角鏡射、拿掉
+      距離閾值、忽略權重、全域單一 δ、不回報 unlocated／unoriented。新模組只 import
+      `gps_placement`、`rotation_averaging`，沒有碰 `posegraph.py`／`compose.py`。
+      **真實資料試跑（52 張、184 對，只用 EXIF 經緯度和 homography，不用 gimbal）**：
+      52 張全部由 EXIF 定位、1 個連通分量、52 張都有 pose，自估 ppm = 28.035，
+      δ = −109.73°。各 node 用自己出發的邊算 `β − α` 減掉對齊後的 φ：同航線邊的殘差
+      沿 line B 線性變化 +10.7° → −5.3°（約 −0.50°/node）——先前只用平移的檢查顯示
+      同航線 `β − α` 本身沿 line B 是平的，所以這個趨勢就是 Stage A 的漂移，量級跟
+      先前的 12～13° 一致；跨航線邊在 line B 東段另外多出 −2～−5°，跟先前量到 B–C
+      跨航線邊的 +2.63° 偏差一致。**Stage D 設計輸入**：用 `β − α` 當航向錨點時，
+      同航線邊看起來是乾淨的訊號，跨航線邊帶著自己的偏差，要分開處理或降權
     - [ ] Stage D: 有界小幅精修（edge + 弱 GPSAnchor；最小可行版本不含
       YawAnchor），接回 `compose_global_transforms`。設計輸入：每條邊的 `β − α`
       當每個 node 的獨立航向錨點，用來修正 Stage C 消不掉的沿航線漂移（概念上
