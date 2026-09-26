@@ -71,6 +71,32 @@ def test_noise_free_chain_across_plus_minus_180_is_recovered_exactly() -> None:
         _assert_angles_close(result.angles[index], np.radians(angle_deg))
 
 
+def test_noise_free_long_chain_with_heterogeneous_weights_is_recovered_exactly() -> None:
+    # Weights span the real inlier_count/median range seen on data/ (~0.01..11). On a long
+    # chain, the plain measurement matrix W's principal eigenvector localizes around the
+    # heaviest edges and decays exponentially away from them until entries underflow to
+    # exactly 0 -- their phases become meaningless (found on the 52-image run: 23
+    # consecutive line-B nodes came out at exactly 0.00 deg, then +-180 deg jumps). Noise
+    # is not needed to trigger it; the expected values are simply the true angles.
+    n = 50
+    true_rad = np.radians(np.arange(n) * 7.3 % 360 - 180)
+    weights = np.geomspace(0.01, 11.0, n - 1)
+    edges = [
+        RelativeRotation(
+            src_index=k,
+            dst_index=k + 1,
+            theta_rad=float(true_rad[k + 1] - true_rad[k]),
+            weight=float(weights[k]),
+        )
+        for k in range(n - 1)
+    ]
+
+    result = average_rotations(edges)
+
+    for k in range(n):
+        _assert_angles_close(result.angles[k], true_rad[k] - true_rad[0], abs_tol=1e-9)
+
+
 def test_gauge_uses_smallest_index_for_non_contiguous_indices() -> None:
     result = average_rotations([_edge(42, 7, -20.0), _edge(7, 3, 50.0)])
 
@@ -100,7 +126,7 @@ def test_result_is_invariant_to_edge_order_and_edge_direction() -> None:
 @pytest.mark.parametrize("n, loop_error_deg", [(3, 6.0), (5, 10.0)])
 def test_equal_weight_loop_spreads_loop_error_evenly(n: int, loop_error_deg: float) -> None:
     # Closed form: gauge-transforming an equal-weight n-cycle with total loop error eps
-    # gives a circulant measurement matrix whose constant mode is the solution, so every
+    # gives a circulant connection Laplacian whose constant mode is the solution, so every
     # edge ends up with residual exactly eps/n.
     true_deg = [37.0 * k for k in range(n)]
     edges = [_edge(k, (k + 1) % n, true_deg[(k + 1) % n] - true_deg[k]) for k in range(n)]

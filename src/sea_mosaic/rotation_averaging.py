@@ -119,12 +119,18 @@ def _connected_components(edges: list[RelativeRotation]) -> list[list[int]]:
 def average_rotations(edges: list[RelativeRotation]) -> RotationAveragingResult:
     """Spectral rotation averaging over each connected component separately.
 
-    For unit complex z, sum_edges w * |z_dst - e^{i theta} z_src|^2 equals
-    const - 2 Re(z^H W z), with W the Hermitian measurement matrix (W[dst,src] =
-    w e^{i theta}). Relaxing |z_k| = 1 to sum |z|^2 = n makes the maximizer W's principal
-    eigenvector; each entry is then projected back onto the unit circle. On consistent
-    (noise-free) measurements the phases are exact for any connected graph -- only the
-    discarded moduli depend on node degree.
+    Minimizes sum_edges w * |z_dst - e^{i theta} z_src|^2 over unit complex z, relaxed to
+    sum |z|^2 = n: the relaxed solution is the eigenvector of the connection Laplacian
+    L = D - W with the smallest eigenvalue (W[dst,src] = w e^{i theta}, Hermitian; D the
+    weighted degrees), then each entry is projected back onto the unit circle. On
+    consistent (noise-free) measurements that eigenvector is exactly z, with equal
+    magnitude in every entry, for any connected graph and any positive weights.
+
+    Not the principal eigenvector of the plain W: with heterogeneous weights (real
+    inlier_count/median ranges ~0.01..11) that eigenvector localizes around the heaviest
+    edges and, on a long chain, decays until entries underflow to exactly 0 and lose their
+    phase -- found on data/'s 52-image run (see CLAUDE.md) and locked in by
+    test_noise_free_long_chain_with_heterogeneous_weights_is_recovered_exactly.
 
     Nodes are exactly those appearing in edges; a node with no edges is outside Stage A's
     concern. Components are solved independently because their relative phase is
@@ -137,17 +143,19 @@ def average_rotations(edges: list[RelativeRotation]) -> RotationAveragingResult:
     component_of: dict[int, int] = {}
     for component_id, members in enumerate(_connected_components(edges)):
         position = {node: k for k, node in enumerate(members)}
-        measurements = np.zeros((len(members), len(members)), dtype=np.complex128)
+        laplacian = np.zeros((len(members), len(members)), dtype=np.complex128)
         for edge in edges:
             if edge.src_index not in position:
                 continue
             s, d = position[edge.src_index], position[edge.dst_index]
             measurement = edge.weight * np.exp(1j * edge.theta_rad)
-            measurements[d, s] += measurement
-            measurements[s, d] += np.conj(measurement)
+            laplacian[d, s] -= measurement
+            laplacian[s, d] -= np.conj(measurement)
+            laplacian[s, s] += edge.weight
+            laplacian[d, d] += edge.weight
 
-        _, eigenvectors = np.linalg.eigh(measurements)
-        z = eigenvectors[:, -1]  # eigh sorts eigenvalues ascending
+        _, eigenvectors = np.linalg.eigh(laplacian)
+        z = eigenvectors[:, 0]  # eigh sorts eigenvalues ascending
         gauge = np.angle(z[0])
         for node, k in position.items():
             angles[node] = _wrap(float(np.angle(z[k]) - gauge))
