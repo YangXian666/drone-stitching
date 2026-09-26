@@ -1000,7 +1000,20 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
   - [ ] **分階段架構（取代一次性聯合最佳化，2026-09-26 定案）**——見「已知的
     限制」的「GPS anchor 框架鏡射 bug 與分階段架構決定」。取代下面那條「旋轉
     退化（暫緩）」。每個 stage 各自 TDD、各自有獨立測試：
-    - [ ] Stage A: `rotation_averaging.py` 譜方法純旋轉平均（含連通分量檢查）
+    - [x] Stage A: `rotation_averaging.py` 譜方法純旋轉平均（含連通分量檢查）——
+      `relative_rotation_from_homography`（中心 Jacobian polar）＋ `average_rotations`
+      （Hermitian 量測矩陣 W 的主特徵向量，各連通分量分開解，最小 index 為 gauge），
+      27 條新測試（`tests/test_rotation_averaging.py`），186/186 全專案綠燈。
+      mutation 檢查：θ 正負號翻轉被 6 條測試抓到、改用 `H[:2,:2]` 被傾斜相機測試
+      抓到、拿掉連通分量切分被 2 條測試抓到。**一度誤判、已更正**：曾以為 W 的
+      主特徵向量在度數不均的鏈上即使無雜訊也會有偏差，改用 connection Laplacian
+      `D − W`；mutation 檢查顯示兩者都通過全部測試，理由是無雜訊時兩者的相位都精確
+      （度數只影響最後被丟掉的模長），而且在單位圓上 `D` 這一項是常數，兩者是同一
+      問題的兩種鬆弛，所以回到原定的 W 主特徵向量。真實資料（0350～0361 鏈，
+      FLANN 配對，weight = inlier_count/1861）對照 GimbalYawDegree：12 個 node 的
+      最大誤差 0.98°，沒有 scale 自由度（對照舊的 `(a,b)` 純旋轉鏈 Check A：角度
+      0.6～6.6°、scale 崩到 0.13～0.57）。這條鏈沒有 loop，結果等於逐邊中心 Jacobian
+      角度的累加
     - [ ] Stage B: GPS 直接擺放（修正 anchor 框架：y=−N、依參考影像 yaw 旋轉、
       anchor 綁影像中心）
     - [ ] Stage C: Stage A 旋轉對齊到 Stage B 座標系（全域旋轉偏移）
