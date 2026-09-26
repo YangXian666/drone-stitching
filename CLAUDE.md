@@ -1142,9 +1142,18 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
       自由度（對照舊的 `(a,b)` 純旋轉鏈 Check A：角度 0.6～6.6°、scale 崩到
       0.13～0.57）。`D − W` 取代 plain W 的完整經過，以及 52 張 loop closure 診斷，
       見「已知的限制」的「Stage A：特徵向量下溢 bug 與 loop closure 診斷」
-    - [ ] Stage A 補正：把違反範圍邊界的
-      `test_real_pair_rotation_matches_gimbal_yaw_difference` 換成 `θ_ab ≈ −θ_ba`
-      正反配對一致性測試（容差 0.5°）；真實資料準確度改成診斷腳本
+    - [x] Stage A 補正：移除違反範圍邊界的
+      `test_real_pair_rotation_matches_gimbal_yaw_difference`，換成兩條只驗證一致性
+      的真實影像測試（188/188 綠燈）：
+      - `test_real_pair_forward_and_reverse_rotations_are_consistent`：新增 fixture
+        0357/0358（直線段、約 2400 inlier），`θ_ab + θ_ba` 實測 −0.066°，容差 0.5°。
+      - `test_real_weak_pair_forward_reverse_repeatability`：0352/0353（全資料集
+        inlier 最少的邊，正向 40、反向 57），實測 −0.819°，容差 1.0°，明確標記為
+        「弱邊可重複性」。拆解：線性化參考點不同 +0.047°、兩次獨立 SIFT/RANSAC
+        擬合 +0.867°——是這條邊的自然不確定性，不是 θ 提取的 bug。
+      真實資料上的準確度（對照 GimbalYawDegree）只留在診斷腳本，不進正式測試。
+      代價：新的高 inlier 測試要 36 秒（兩個方向各一次約 19 萬×19 萬 descriptor 的
+      BF kNN），全套測試從約 10 秒變成約 50 秒
     - [ ] Stage B: `gps_placement.py`——北向上像素座標系的影像中心位置
       （`x = ppm·E`、`y = −ppm·N`，不含旋轉）＋ 從資料自估 `pixels_per_meter`
       ＋ 只接受 EXIF 來源經緯度的薄包裝（XMP 來源視同沒有 GPS）。測試規劃
@@ -1162,7 +1171,12 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
       兩個候選假設，都還沒確認：(1) 沒有做鏡頭畸變校正，homography 去擬合徑向畸變
       產生跟位移成正比的旋轉偏差；(2) 透視項 g 方向一致（見「第二個座標系陷阱」，
       中心 Jacobian 只消掉約 5/6，殘留部分同號累積）。不管根因是哪個，Stage C/D
-      都需要絕對旋轉參考（GimbalYawDegree，或 GPS 航跡方位角減影像內前進方向）
+      都需要絕對旋轉參考（GimbalYawDegree，或 GPS 航跡方位角減影像內前進方向）。
+      **候選 (3)：RANSAC 在海面上的擬合噪聲**（「第二個座標系陷阱」提過）。佐證
+      （2026-09-26，順帶量到、沒有深究）：同一對影像 0352/0353 做兩次獨立 SIFT/
+      RANSAC 擬合（正向、反向），perspective row 相差約 6 倍（正向
+      `(1.97e-5, 1.08e-5)`，反向 `(3.00e-6, −1.04e-6)`），代表至少在弱邊上，g 的
+      大小主要由擬合決定，不是穩定的物理量。只有一對，不足以下結論
   - [ ] ~~posegraph.py: `compose_global_transforms` 的旋轉退化（暫緩）~~ ——
     **已被上面的分階段架構取代（2026-09-26）**，原文保留作紀錄：
     **暫緩，等 10 月正式資料集重新評估，不是現在要修的 bug**（見上面

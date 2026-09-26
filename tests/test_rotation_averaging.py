@@ -20,7 +20,6 @@ import numpy as np
 import pytest
 
 from sea_mosaic.estimate import match_pair
-from sea_mosaic.io_utils import load_gimbal_yaw
 from sea_mosaic.matcher import MatchResult
 from sea_mosaic.rotation_averaging import (
     RelativeRotation,
@@ -347,7 +346,7 @@ def test_non_finite_homography_raises_value_error(bad_value: float) -> None:
 
 
 # ---------------------------------------------------------------------------
-# End to end on real images, against an independently measured truth
+# Real images: consistency only (no external truth -- see CLAUDE.md's scope decision)
 # ---------------------------------------------------------------------------
 
 
@@ -372,20 +371,42 @@ class _SiftRatioMatcher:
         )
 
 
-def test_real_pair_rotation_matches_gimbal_yaw_difference() -> None:
-    # 0352 -> 0353 (the U-turn). Truth is the GimbalYawDegree difference (-62.2 deg), an
-    # independent sensor reading never used by Stage A itself. Measured when this test was
-    # written: -62.785 deg (error -0.585 deg, 40 inliers).
-    path_src = FIXTURES / "DJI_20230127131426_0352_W.JPG"
-    path_dst = FIXTURES / "DJI_20230127131429_0353_W.JPG"
-    image_src, image_dst = cv2.imread(str(path_src)), cv2.imread(str(path_dst))
-    pair = match_pair(_SiftRatioMatcher(), image_src, image_dst, 0, 1)
+def _forward_reverse_theta_sum_deg(name_a: str, name_b: str) -> float:
+    image_a = cv2.imread(str(FIXTURES / name_a))
+    image_b = cv2.imread(str(FIXTURES / name_b))
+    matcher = _SiftRatioMatcher()
+    forward = match_pair(matcher, image_a, image_b, 0, 1)
+    reverse = match_pair(matcher, image_b, image_a, 1, 0)
+    theta_ab = relative_rotation_from_homography(forward.homography, image_a.shape)
+    theta_ba = relative_rotation_from_homography(reverse.homography, image_b.shape)
+    return float(np.degrees(_wrap(theta_ab + theta_ba)))
 
-    theta_ab = relative_rotation_from_homography(pair.homography, image_src.shape)
-    result = average_rotations(
-        [RelativeRotation(src_index=0, dst_index=1, theta_rad=theta_ab, weight=1.0)]
+
+def test_real_pair_forward_and_reverse_rotations_are_consistent() -> None:
+    # Consistency, not accuracy: matching the same real pair in both directions (two
+    # independent SIFT/RANSAC fits) must give theta_ab ~= -theta_ba. No external truth is
+    # used -- per CLAUDE.md's 最小可行版本範圍決定, formal tests may not use GimbalYawDegree
+    # or any DJI XMP field as an expected value. 0357 -> 0358 is a straight-line pair
+    # with ~2400 inliers; measured when written: sum -0.066 deg (linearization-point part
+    # +0.015 deg, separate-fit part +0.081 deg).
+    total = _forward_reverse_theta_sum_deg(
+        "DJI_20230127131440_0357_W.JPG", "DJI_20230127131442_0358_W.JPG"
     )
 
-    gimbal_delta = np.radians(load_gimbal_yaw(path_dst) - load_gimbal_yaw(path_src))
-    error_deg = np.degrees(_wrap(result.angles[1] - result.angles[0] - gimbal_delta))
-    assert abs(error_deg) < 1.0
+    assert abs(total) < 0.5
+
+
+def test_real_weak_pair_forward_reverse_repeatability() -> None:
+    # Weak-edge repeatability, not accuracy. 0352 -> 0353 (the U-turn) has the lowest
+    # inlier count in the whole 52-image dataset (40 forward / 57 reverse). Measured when
+    # written: theta_ab + theta_ba = -0.819 deg, decomposed into
+    #   +0.047 deg  linearization reference point (src centre vs dst centre), and
+    #   +0.867 deg  two independent SIFT/RANSAC fits (the reverse fit's perspective row is
+    #               ~6x smaller than the forward fit's).
+    # This is the edge's natural uncertainty, not a bug in theta extraction -- hence the
+    # looser 1.0 deg bound than the high-inlier consistency test above.
+    total = _forward_reverse_theta_sum_deg(
+        "DJI_20230127131426_0352_W.JPG", "DJI_20230127131429_0353_W.JPG"
+    )
+
+    assert abs(total) < 1.0
