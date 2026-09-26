@@ -1342,8 +1342,18 @@ docs/task2.md 是這個專案的 metrics 規格書，也是驗收標準。
       先前的 12～13° 一致；跨航線邊在 line B 東段另外多出 −2～−5°，跟先前量到 B–C
       跨航線邊的 +2.63° 偏差一致。**Stage D 設計輸入**：用 `β − α` 當航向錨點時，
       同航線邊看起來是乾淨的訊號，跨航線邊帶著自己的偏差，要分開處理或降權
-    - [ ] Stage A 補強：可選的 GimbalYawDegree 弱錨點（地面節點，權重 1），見「範圍
-      調整：GimbalYawDegree 以可選弱錨點回到 Stage A」；TDD 進行中
+    - [x] Stage A 補強：可選的 GimbalYawDegree 弱錨點，見「範圍調整：GimbalYawDegree
+      以可選弱錨點回到 Stage A」。`average_rotations(edges, heading_anchors=None,
+      anchor_weight=None)`：有錨點時加一個內部地面節點（最小 index，所以自動成為 gauge，
+      不出現在輸出），每個錨點是一條「地面 → node」的弱邊；`anchor_weight` 必填、無
+      靜默預設；`GIMBAL_YAW_ANCHOR_WEIGHT = 1.0`。同一分量內多個錨點彼此不一致時，
+      結果是所有錨點的最小平方折衷，不由任何單一錨點決定（有專門測試：等於線性最小
+      平方解、誤差平均 = 錨點噪聲平均、剛性極限下全部平移同一平均值）。沒有錨點時跟
+      之前逐位元相同。16 條新測試（45/45），全套 257/257（不含進行中的 Stage D）。
+      mutation：拿掉錨點項（8 條抓到）、錨點當硬覆寫（2 條）、錨點正負號（7 條）、
+      權重靜默預設（1 條）。正式函式重跑真實資料：line B 斜率 −0.496 → −0.033°/node、
+      全部 node 殘差中位數 5.28° → 0.74°；Stage C 的 δ 從 −109.73° 變成 −2.04°
+      （跟先前量到的 gimbal 與影像朝向約 1.8° 常數差同量級）
     - [ ] Stage D: `refinement.py`——有界小幅精修（edge 用 K=30 個 inlier 對應點、
       弱 GPS 項＋全域 κ、逐邊航向錨點取代 YawAnchor），設計已定案，見「Stage D
       設計定案」；第一次實作求解器不收斂，改採兩階段求解，D2b／D14 待處理。接回

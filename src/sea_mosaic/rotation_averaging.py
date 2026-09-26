@@ -1,9 +1,15 @@
 """Stage A of the staged pose-graph architecture: pure rotation averaging.
 
-Consumes only edges' relative rotations -- never GPS, never GimbalYawDegree (see
-CLAUDE.md's 分階段架構決定). Each node's orientation is a unit complex number, so there
-is no scale degree of freedom to collapse; the result's gauge (which node sits at angle
-0) is arbitrary and is replaced later by Stage C's alignment to the GPS frame.
+Consumes edges' relative rotations, never GPS (see CLAUDE.md's 分階段架構決定). Each
+node's orientation is a unit complex number, so there is no scale degree of freedom to
+collapse. Without anchors the result's gauge (which node sits at angle 0) is arbitrary and
+is replaced later by Stage C's alignment to the GPS frame.
+
+Optional heading anchors (e.g. GimbalYawDegree, per CLAUDE.md's 範圍調整 of 2026-09-26)
+enter as weak edges from an internal ground node at angle 0, so anchored components come
+out in the anchors' absolute frame. The anchors suppress the drift that is self-cancelling
+around loops but accumulates along lines. Without anchors the behaviour is exactly as
+before; this module never reads metadata itself -- callers pass anchor values in radians.
 
 Angle convention: a node's angle is the rotation of its image-to-mosaic pose, and an
 edge's theta_rad is theta_dst - theta_src.
@@ -14,6 +20,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+
+# Anchor weight for GimbalYawDegree, relative to edge weights of inlier_count / median.
+# Chosen from data/'s real-data sweep (0.01 / 0.1 / 1 / 10): at 1 the line-B drift slope
+# fell from -0.496 to -0.033 deg/node, and 10 gave no further improvement. Data-derived,
+# like the 5 m threshold: re-validate on the October dataset.
+GIMBAL_YAW_ANCHOR_WEIGHT = 1.0
+
+# Internal node id for the anchors' ground node; never returned to callers. Being the
+# smallest id, it becomes the gauge (angle 0) of every component it joins.
+_GROUND = -(1 << 62)
 
 
 @dataclass(frozen=True)
@@ -116,7 +132,40 @@ def _connected_components(edges: list[RelativeRotation]) -> list[list[int]]:
     return components
 
 
-def average_rotations(edges: list[RelativeRotation]) -> RotationAveragingResult:
+def average_rotations(
+    edges: list[RelativeRotation],
+    heading_anchors: dict[int, float] | None = None,
+    anchor_weight: float | None = None,
+) -> RotationAveragingResult:
+    """Spectral rotation averaging, optionally with weak absolute heading anchors.
+
+    heading_anchors maps node -> absolute angle (radians) in the anchors' frame; each
+    becomes an edge ground -> node with theta = anchor value and weight anchor_weight, which
+    is required whenever anchors are given (no silent default). A node may appear through
+    an anchor alone. Every component containing an anchored node is solved in the absolute
+    frame; when its anchors disagree (sensor noise), the orientation is the least-squares
+    compromise of all of them, not any single anchor's value. Components without anchors
+    keep the smallest-index gauge. Component ids count the ground node, so components
+    joined only through anchors share one id.
+    """
+    if heading_anchors is None:
+        return _average_rotations(edges)
+    if anchor_weight is None or not (np.isfinite(anchor_weight) and anchor_weight > 0):
+        raise ValueError("anchor_weight must be given, finite and > 0 when heading_anchors are given")
+    for node, value in heading_anchors.items():
+        if not np.isfinite(value):
+            raise ValueError(f"non-finite heading anchor for node {node}")
+    anchor_edges = [
+        RelativeRotation(_GROUND, node, float(value), float(anchor_weight))
+        for node, value in heading_anchors.items()
+    ]
+    result = _average_rotations(list(edges) + anchor_edges)
+    result.angles.pop(_GROUND, None)
+    result.component_of.pop(_GROUND, None)
+    return result
+
+
+def _average_rotations(edges: list[RelativeRotation]) -> RotationAveragingResult:
     """Spectral rotation averaging over each connected component separately.
 
     Minimizes sum_edges w * |z_dst - e^{i theta} z_src|^2 over unit complex z, relaxed to

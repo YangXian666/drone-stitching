@@ -410,3 +410,186 @@ def test_real_weak_pair_forward_reverse_repeatability() -> None:
     )
 
     assert abs(total) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Optional heading anchors (e.g. GimbalYawDegree), added through a ground node
+# ---------------------------------------------------------------------------
+# Per CLAUDE.md's 範圍調整 (2026-09-26): GimbalYawDegree may enter Stage A as an optional
+# weak anchor. With anchors the result is in the absolute frame (a node's angle equals
+# its anchor's frame, e.g. compass yaw in the north-up pixel frame); without anchors
+# Stage A must behave exactly as before. All expected values below are synthetic.
+
+
+def _chain(true_deg: list[float], bias_deg: float = 0.0) -> list[RelativeRotation]:
+    return [_edge(k, k + 1, true_deg[k + 1] - true_deg[k] + bias_deg) for k in range(len(true_deg) - 1)]
+
+
+def test_anchor_weight_constant_is_the_measured_value() -> None:
+    from sea_mosaic.rotation_averaging import GIMBAL_YAW_ANCHOR_WEIGHT
+
+    assert GIMBAL_YAW_ANCHOR_WEIGHT == 1.0  # CLAUDE.md: chosen from the real-data sweep
+
+
+def test_exact_anchors_give_absolute_angles() -> None:
+    true_deg = [70.8, 70.8, 39.0, -23.2, -54.6, -104.3]
+    anchors = {k: float(np.radians(a)) for k, a in enumerate(true_deg)}
+
+    result = average_rotations(_chain(true_deg), heading_anchors=anchors, anchor_weight=1.0)
+
+    for k, a in enumerate(true_deg):
+        _assert_angles_close(result.angles[k], np.radians(a), abs_tol=1e-9)
+    assert set(result.angles) == set(range(6))  # the internal ground node is not reported
+
+
+def test_anchors_wrap_across_plus_minus_180() -> None:
+    true_deg = [179.0, -179.0, 175.0, -170.0]
+    anchors = {k: float(np.radians(a)) for k, a in enumerate(true_deg)}
+
+    result = average_rotations(_chain(true_deg), heading_anchors=anchors, anchor_weight=1.0)
+
+    for k, a in enumerate(true_deg):
+        _assert_angles_close(result.angles[k], np.radians(a), abs_tol=1e-9)
+
+
+def test_biased_chain_with_unbiased_anchors_matches_small_angle_least_squares() -> None:
+    # Every edge carries +0.4 deg (loop-consistent drift); anchors are unbiased. Independent
+    # derivation: with e_k = theta_k - psi_k, minimize sum (e_{k+1} - e_k - b)^2 (edge weight
+    # 1) + w * sum e_k^2 -- a linear least-squares problem solved directly below. The
+    # spectral relaxation matches it to third order in the inconsistency (~3e-4 deg here).
+    true_deg = [0.0, 5.0, 10.0, 15.0, 20.0, 25.0]
+    n, b, w = len(true_deg), np.radians(0.4), 1.0
+    anchors = {k: float(np.radians(a)) for k, a in enumerate(true_deg)}
+    rows, rhs = [], []
+    for k in range(n - 1):
+        row = np.zeros(n)
+        row[k], row[k + 1] = -1.0, 1.0
+        rows.append(row)
+        rhs.append(b)
+    for k in range(n):
+        row = np.zeros(n)
+        row[k] = np.sqrt(w)
+        rows.append(row)
+        rhs.append(0.0)
+    expected_error = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)[0]
+
+    result = average_rotations(_chain(true_deg, bias_deg=0.4), heading_anchors=anchors, anchor_weight=w)
+
+    for k in range(n):
+        actual_error_deg = np.degrees(_wrap(result.angles[k] - np.radians(true_deg[k])))
+        assert actual_error_deg == pytest.approx(np.degrees(expected_error[k]), abs=1e-3)
+
+
+def test_anchors_suppress_drift_compared_with_no_anchors() -> None:
+    true_deg = [0.0] * 12
+    edges = _chain(true_deg, bias_deg=0.4)
+
+    free = average_rotations(edges)
+    anchored = average_rotations(edges, heading_anchors={k: 0.0 for k in range(12)}, anchor_weight=1.0)
+
+    # Without anchors the gauge is node 0, so drift accumulates to 11 * 0.4 = 4.4 deg.
+    assert np.degrees(_wrap(free.angles[11] - free.angles[0])) == pytest.approx(4.4, abs=1e-6)
+    worst = max(abs(np.degrees(_wrap(a))) for a in anchored.angles.values())
+    assert worst < 1.0
+
+
+def test_inconsistent_anchors_in_one_component_resolve_to_weighted_least_squares() -> None:
+    # Several anchored nodes in one component, anchors with small independent errors n_k
+    # (like per-image GimbalYawDegree sensor noise); edges exact. Explicit rule: the frame
+    # is fixed by the ground node, and the orientation is the least-squares compromise of
+    # all anchors -- no single anchor defines it. Three checks:
+    # (1) equals the small-angle linear least squares
+    #     min sum_edges w_e (e_j - e_i)^2 + w sum_k (e_k - n_k)^2, solved directly;
+    # (2) exact invariant (edge gradients cancel pairwise): with equal anchor weights,
+    #     mean_k e_k == mean_k n_k, whatever the edge weights;
+    # (3) rigid limit (edge weight 1e6): every node is offset by mean_k n_k.
+    true_deg = [70.8, 70.8, 70.8, 71.0, 70.5, 70.8]
+    noise_deg = [0.3, -0.2, 0.5, -0.1, 0.0, 0.2]
+    n, w = len(true_deg), 1.0
+    anchors = {k: float(np.radians(true_deg[k] + noise_deg[k])) for k in range(n)}
+
+    for edge_weight in (1.0, 1e6):
+        edges = [
+            RelativeRotation(k, k + 1, float(np.radians(true_deg[k + 1] - true_deg[k])), edge_weight)
+            for k in range(n - 1)
+        ]
+        result = average_rotations(edges, heading_anchors=anchors, anchor_weight=w)
+        errors_deg = np.array([np.degrees(_wrap(result.angles[k] - np.radians(true_deg[k]))) for k in range(n)])
+
+        rows, rhs = [], []
+        for k in range(n - 1):
+            row = np.zeros(n)
+            row[k], row[k + 1] = -np.sqrt(edge_weight), np.sqrt(edge_weight)
+            rows.append(row)
+            rhs.append(0.0)
+        for k in range(n):
+            row = np.zeros(n)
+            row[k] = np.sqrt(w)
+            rows.append(row)
+            rhs.append(np.sqrt(w) * np.radians(noise_deg[k]))
+        expected_deg = np.degrees(np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)[0])
+
+        assert errors_deg == pytest.approx(expected_deg, abs=1e-3)  # (1)
+        assert errors_deg.mean() == pytest.approx(np.mean(noise_deg), abs=1e-3)  # (2)
+        if edge_weight == 1e6:
+            assert errors_deg == pytest.approx([np.mean(noise_deg)] * n, abs=1e-3)  # (3)
+
+
+def test_nodes_without_anchor_follow_edges_in_the_absolute_frame() -> None:
+    true_deg = [30.0, 45.0, 60.0, 75.0]
+    anchors = {0: float(np.radians(30.0))}  # only node 0 anchored
+
+    result = average_rotations(_chain(true_deg), heading_anchors=anchors, anchor_weight=1.0)
+
+    for k, a in enumerate(true_deg):
+        _assert_angles_close(result.angles[k], np.radians(a), abs_tol=1e-9)
+
+
+def test_anchors_join_otherwise_disconnected_components() -> None:
+    edges = [_edge(0, 1, 20.0), _edge(5, 6, -10.0)]
+    anchors = {0: float(np.radians(100.0)), 5: float(np.radians(-60.0))}
+
+    result = average_rotations(edges, heading_anchors=anchors, anchor_weight=1.0)
+
+    assert len(set(result.component_of.values())) == 1
+    _assert_angles_close(result.angles[1], np.radians(120.0), abs_tol=1e-9)
+    _assert_angles_close(result.angles[6], np.radians(-70.0), abs_tol=1e-9)
+
+
+def test_anchor_only_node_takes_its_anchor_value() -> None:
+    result = average_rotations([_edge(0, 1, 15.0)], heading_anchors={0: 0.2, 9: -1.1}, anchor_weight=1.0)
+
+    _assert_angles_close(result.angles[9], -1.1, abs_tol=1e-9)
+    _assert_angles_close(result.angles[1], 0.2 + np.radians(15.0), abs_tol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "anchors, weight",
+    [
+        ({0: 0.1}, None),
+        ({0: 0.1}, 0.0),
+        ({0: 0.1}, -1.0),
+        ({0: 0.1}, float("nan")),
+        ({0: float("nan")}, 1.0),
+        ({0: float("inf")}, 1.0),
+    ],
+)
+def test_invalid_anchor_inputs_raise(anchors, weight) -> None:
+    with pytest.raises(ValueError):
+        average_rotations([_edge(0, 1, 5.0)], heading_anchors=anchors, anchor_weight=weight)
+
+
+def test_no_anchors_is_bitwise_identical_to_before() -> None:
+    # Values recorded (float.hex) from average_rotations before anchors existed.
+    edges = [
+        RelativeRotation(0, 1, 0.30, 1.0),
+        RelativeRotation(1, 2, -0.52, 2.5),
+        RelativeRotation(2, 3, 1.10, 0.4),
+        RelativeRotation(3, 0, -0.95, 1.7),
+        RelativeRotation(1, 3, 0.61, 0.9),
+    ]
+    recorded = {0: "0x0.0p+0", 1: "0x1.47e28ca1b8450p-2", 2: "-0x1.8e7b22560a730p-3", 3: "0x1.e050f4a2faa90p-1"}
+
+    for result in (average_rotations(edges), average_rotations(edges, heading_anchors=None)):
+        assert {k: float(v).hex() for k, v in sorted(result.angles.items())} == recorded
+        assert result.component_of == {0: 0, 1: 0, 2: 0, 3: 0}
