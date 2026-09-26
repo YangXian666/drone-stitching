@@ -315,3 +315,129 @@ def test_stage_a_b_c_results_are_identical_with_xmp_stripped(tmp_path: Path) -> 
     assert set(a.poses) == set(b.poses) == {0, 1}
     for k in a.poses:
         assert np.array_equal(a.poses[k], b.poses[k])
+
+
+# ---------------------------------------------------------------------------
+# gps_heading_anchors: GPS-derived (beta - alpha) heading anchors for Stage A
+# ---------------------------------------------------------------------------
+# Per CLAUDE.md's Stage D 改為只精修位置: for the path without GimbalYawDegree, each
+# edge's h = beta - alpha (GPS displacement direction minus the travel direction measured
+# in the image) is an absolute heading observation of a node; each edge gives one per
+# direction. Per node they are combined with weight 1/sigma^2, sigma^2 = sigma_alpha(alpha)^2
+# + (0.174 m / d)^2, and Huber reweighting (c = 1.345). No metadata beyond EXIF lat/lon.
+
+import sea_mosaic.frame_alignment as fa  # noqa: E402  (attributes looked up per test)
+
+
+def _anchor_world(cameras: dict[int, SyntheticCamera], pairs, latlon_offsets_m=None):
+    latlons = {}
+    for k, cam in cameras.items():
+        de, dn = (latlon_offsets_m or {}).get(k, (0.0, 0.0))
+        latlons[k] = latlon_from_en(cam.east_m + de, cam.north_m + dn)
+    edges = [HeadingEdge(i, j, plane_homography(cameras[i], cameras[j]), IMAGE_SHAPE, 1.0) for i, j in pairs]
+    return latlons, edges, {k: IMAGE_SHAPE for k in cameras}
+
+
+def test_gps_heading_anchor_weight_is_the_neutral_default() -> None:
+    assert fa.GPS_HEADING_ANCHOR_WEIGHT == 1.0  # CLAUDE.md: neutral default, not chosen via gimbal
+
+
+def test_gps_heading_sigma_values() -> None:
+    cross_track_m = np.radians(1.4826 * 0.5) * 13.5  # 0.174 m, from the 13.5 m along-track sigma
+    along = np.radians(1.4826 * 0.5)
+    across = np.radians(1.4826 * np.sqrt(0.5**2 + 57.0))
+    for alpha_deg in (90.0, -90.0):
+        for d in (6.0, 13.5, 40.0):
+            assert fa.gps_heading_sigma_rad(np.radians(alpha_deg), d) == pytest.approx(np.hypot(along, cross_track_m / d), rel=1e-12)
+    assert fa.gps_heading_sigma_rad(0.0, 13.5) == pytest.approx(np.hypot(across, cross_track_m / 13.5), rel=1e-12)
+    assert fa.gps_heading_sigma_rad(np.radians(90.0), 6.0) > fa.gps_heading_sigma_rad(np.radians(90.0), 40.0)
+
+
+def test_gps_heading_anchors_equal_camera_yaws_on_exact_data() -> None:
+    # Serpentine: two lines 175 deg apart plus cross-line edges; both directions of every
+    # edge contribute. Truth: in the north-up pixel frame a node's angle is its compass yaw.
+    line_b = [SyntheticCamera(13.4 * k * np.sin(np.radians(83.0)), 13.4 * k * np.cos(np.radians(83.0)), 100.0, 70.8) for k in range(4)]
+    line_c = [SyntheticCamera(c.east_m - 3.3, c.north_m + 27.0, 100.0, -104.3) for c in line_b]
+    cameras = dict(enumerate(line_b + line_c))
+    pairs = [(k, k + 1) for k in range(3)] + [(k, k + 1) for k in range(4, 7)] + [(k, k + 4) for k in range(4)]
+    latlons, edges, shapes = _anchor_world(cameras, pairs)
+
+    anchors = fa.gps_heading_anchors(latlons, edges, shapes)
+
+    assert set(anchors) == set(cameras)
+    for k, cam in cameras.items():
+        assert np.degrees(_wrap(anchors[k] - np.radians(cam.yaw_deg))) == pytest.approx(0.0, abs=1e-3)
+
+
+def test_robust_combination_resists_a_short_edge_with_gps_error() -> None:
+    # The 0351 pathology: node 0 has three correct along-track edges (13.4 / 26.8 / 40.2 m)
+    # and one 6 m edge, exactly along the image's vertical axis, whose neighbour's GPS is
+    # off by 1.6 m across track (a ~15 deg direction error). Hand estimate: plain weighted
+    # mean pulled ~1.0 deg off, Huber-reweighted ~0.2 deg. Capability claim: robust error
+    # <= 0.35 x non-robust error; the non-robust value equals the closed-form weighted
+    # circular mean of the observations (weights from the separately tested sigma).
+    yaw = 83.0  # course == yaw, so along-track edges sit at alpha = -90 deg exactly
+    along = lambda d: SyntheticCamera(d * np.sin(np.radians(yaw)), d * np.cos(np.radians(yaw)), 100.0, yaw)
+    cameras = {0: along(0.0), 1: along(13.4), 2: along(26.8), 3: along(40.2), 4: along(-6.0)}
+    across = (1.6 * np.cos(np.radians(yaw)), -1.6 * np.sin(np.radians(yaw)))
+    latlons, edges, shapes = _anchor_world(cameras, [(0, 1), (0, 2), (0, 3), (0, 4)], latlon_offsets_m={4: across})
+
+    robust = fa.gps_heading_anchors(latlons, edges, shapes)[0]
+    plain = fa.gps_heading_anchors(latlons, edges, shapes, robust=False)[0]
+    truth = np.radians(yaw)
+
+    robust_err, plain_err = abs(_wrap(robust - truth)), abs(_wrap(plain - truth))
+    assert np.degrees(plain_err) > 0.5  # the case actually bites
+    assert robust_err <= 0.35 * plain_err
+
+
+def test_edges_shorter_than_threshold_are_ignored_and_unobserved_nodes_absent() -> None:
+    cameras = {0: SyntheticCamera(0.0, 0.0, 100.0, 70.8), 1: SyntheticCamera(12.8, 1.6, 100.0, 70.8),
+               2: SyntheticCamera(14.9, 2.0, 100.0, 70.8)}  # 1 -> 2 is ~2.1 m
+    latlons, edges, shapes = _anchor_world(cameras, [(0, 1), (1, 2)])
+
+    anchors = fa.gps_heading_anchors(latlons, edges, shapes)
+
+    assert set(anchors) == {0, 1}
+
+
+def test_edges_touching_a_node_without_latlon_are_skipped() -> None:
+    cameras = {0: SyntheticCamera(0.0, 0.0, 100.0, 70.8), 1: SyntheticCamera(12.8, 1.6, 100.0, 70.8),
+               2: SyntheticCamera(25.6, 3.2, 100.0, 70.8)}
+    latlons, edges, shapes = _anchor_world(cameras, [(0, 1), (1, 2)])
+    del latlons[2]
+
+    anchors = fa.gps_heading_anchors(latlons, edges, shapes)
+
+    assert set(anchors) == {0, 1}
+
+
+def test_gps_anchors_suppress_stage_a_drift_end_to_end() -> None:
+    # Stage A edges carry +0.4 deg each (loop-consistent drift, 11 * 0.4 = 4.4 deg without
+    # anchors); GPS-derived anchors from exact synthetic cameras remove most of it.
+    cameras = {k: SyntheticCamera(13.4 * k * np.sin(np.radians(83.0)), 13.4 * k * np.cos(np.radians(83.0)), 100.0, 70.8) for k in range(12)}
+    pairs = [(k, k + 1) for k in range(11)]
+    latlons, edges, shapes = _anchor_world(cameras, pairs)
+    stage_a_edges = [RelativeRotation(i, j, float(np.radians(0.4)), 1.0) for i, j in pairs]  # true relative yaw is 0
+
+    anchored = average_rotations(
+        stage_a_edges, heading_anchors=fa.gps_heading_anchors(latlons, edges, shapes), anchor_weight=fa.GPS_HEADING_ANCHOR_WEIGHT
+    )
+
+    worst = max(abs(np.degrees(_wrap(anchored.angles[k] - np.radians(70.8)))) for k in cameras)
+    assert worst < 1.0
+
+
+@pytest.mark.parametrize("bad", ["nan_homography", "zero_weight"])
+def test_gps_heading_anchors_invalid_inputs_raise(bad: str) -> None:
+    cameras = {0: SyntheticCamera(0.0, 0.0, 100.0, 70.8), 1: SyntheticCamera(12.8, 1.6, 100.0, 70.8)}
+    latlons, edges, shapes = _anchor_world(cameras, [(0, 1)])
+    if bad == "nan_homography":
+        H = edges[0].homography.copy()
+        H[0, 0] = np.nan
+        edges = [HeadingEdge(0, 1, H, IMAGE_SHAPE, 1.0)]
+    else:
+        edges = [HeadingEdge(0, 1, edges[0].homography, IMAGE_SHAPE, 0.0)]
+
+    with pytest.raises(ValueError):
+        fa.gps_heading_anchors(latlons, edges, shapes)

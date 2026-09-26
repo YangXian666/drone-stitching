@@ -21,8 +21,28 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from sea_mosaic.geo.projection import geodetic_to_local_xy
 from sea_mosaic.gps_placement import MIN_GPS_DISPLACEMENT_M, GpsPlacement
 from sea_mosaic.rotation_averaging import RotationAveragingResult
+
+# GPS-derived heading anchors (gps_heading_anchors). All values data-derived on data/ and to
+# be re-validated on the October dataset -- see CLAUDE.md's Stage D 設計定案 and
+# Stage D 改為只精修位置 for the derivations and limitations.
+MAD_TO_SIGMA = 1.4826  # standard deviation per median absolute deviation (normal)
+HEADING_SIGMA0_DEG = 0.5  # along-track (beta - alpha) spread, median absolute deviation
+HEADING_K_DEG2 = 57.0  # growth of that spread as travel turns across the image
+# Cross-track GPS error implied by the 0.74 deg along-track sigma at the typical 13.5 m
+# spacing (0.174 m): makes short baselines less trusted. Without it an 8.4 m edge at a
+# U-turn, aligned with the image's vertical axis, got the highest weight of all and pulled
+# its node 11 deg off (the 0351 case).
+CROSS_TRACK_SIGMA_M = float(np.radians(MAD_TO_SIGMA * HEADING_SIGMA0_DEG) * 13.5)
+HUBER_C = 1.345  # Huber constant for 95% efficiency under normal noise
+# Neutral default weight for these anchors in average_rotations: one anchor counts as much
+# as one typical edge (edge weights are inlier/median, median 1), neither boosted nor
+# damped. Deliberately NOT chosen by comparing against GimbalYawDegree (that comparison is
+# only a diagnostic), so the metadata-free path does not get a parameter picked with gimbal
+# data.
+GPS_HEADING_ANCHOR_WEIGHT = 1.0
 
 
 @dataclass(frozen=True)
@@ -139,3 +159,79 @@ def align_to_gps_frame(
         unlocated={node for node in stage_a.angles if node not in centres},
         unoriented={node for node in centres if node not in stage_a.angles},
     )
+
+
+def gps_heading_sigma_rad(alpha_rad: float, distance_m: float) -> float:
+    """Standard deviation (radians) of one GPS-derived heading observation h = beta - alpha.
+
+    sigma^2 = sigma_alpha^2 + (CROSS_TRACK_SIGMA_M / d)^2, with
+    sigma_alpha = radians(1.4826 * sqrt(sigma0^2 + k cos^2 alpha)). alpha is the travel
+    direction measured in the observing image, atan2(v_y, v_x) in pixels with y pointing
+    down, so the image's vertical axis (along-track) is alpha = +-90 deg.
+    """
+    sigma_alpha = np.radians(MAD_TO_SIGMA * np.sqrt(HEADING_SIGMA0_DEG**2 + HEADING_K_DEG2 * np.cos(alpha_rad) ** 2))
+    return float(np.hypot(sigma_alpha, CROSS_TRACK_SIGMA_M / distance_m))
+
+
+def gps_heading_anchors(
+    latlons: dict[int, tuple[float, float]],
+    edges: list[HeadingEdge],
+    image_shapes: dict[int, tuple[int, ...]],
+    *,
+    min_gps_distance_m: float = MIN_GPS_DISPLACEMENT_M,
+    robust: bool = True,
+) -> dict[int, float]:
+    """Absolute heading anchors (radians, north-up pixel frame) from GPS track bearing.
+
+    For the path without GimbalYawDegree: pass the result to
+    average_rotations(..., heading_anchors=..., anchor_weight=GPS_HEADING_ANCHOR_WEIGHT).
+    Each edge whose endpoints both have lat/lon and are at least min_gps_distance_m apart
+    gives one observation per direction: for node i, h = beta - alpha with beta the
+    direction of i -> j in the north-up pixel frame (x = East, y = -North; needs no
+    pixels_per_meter) and alpha the direction to j's centre measured in i's image. Neither
+    depends on Stage A. Per node, observations are combined as a circular mean weighted by
+    edge.weight / gps_heading_sigma_rad^2, then (robust=True) Huber-reweighted on
+    sigma-normalized residuals to resist gross errors such as GPS/exposure timing offsets
+    during turns. Nodes with no usable observation are absent from the result. robust
+    exists so a capability test can compare against the plain weighted mean.
+
+    Raises ValueError for a non-finite homography or a non-positive edge weight.
+    """
+    _validate(edges, 1.0)
+    observations: dict[int, list[tuple[float, float, float]]] = {}  # node -> (h, sigma, weight)
+    for edge in edges:
+        i, j = edge.src_index, edge.dst_index
+        if i not in latlons or j not in latlons:
+            continue
+        east_m, north_m = geodetic_to_local_xy(*latlons[j], *latlons[i])
+        distance_m = float(np.hypot(east_m, north_m))
+        if distance_m < min_gps_distance_m:
+            continue
+        H = edge.homography
+        src_centre = _image_centre(edge.src_image_shape)
+        dst_centre = _image_centre(image_shapes[j])
+        for node, bearing, homography, own_centre, other_centre in (
+            (i, np.arctan2(-north_m, east_m), np.linalg.inv(H), src_centre, dst_centre),
+            (j, np.arctan2(north_m, -east_m), H, dst_centre, src_centre),
+        ):
+            # Where the other image's centre lands in this node's image, relative to its own centre.
+            mapped = homography @ np.append(other_centre, 1.0)
+            vector = mapped[:2] / mapped[2] - own_centre
+            alpha = np.arctan2(vector[1], vector[0])
+            observations.setdefault(node, []).append(
+                (_wrap(bearing - alpha), gps_heading_sigma_rad(alpha, distance_m), edge.weight)
+            )
+
+    anchors = {}
+    for node, obs in observations.items():
+        h = np.array([o[0] for o in obs])
+        sigma = np.array([o[1] for o in obs])
+        base = np.array([o[2] for o in obs]) / sigma**2
+        mean = float(np.angle(np.sum(base * np.exp(1j * h))))
+        if robust:
+            for _ in range(20):
+                normalized = np.abs([_wrap(value - mean) for value in h]) / sigma
+                weights = base * np.where(normalized <= HUBER_C, 1.0, HUBER_C / np.maximum(normalized, 1e-12))
+                mean = float(np.angle(np.sum(weights * np.exp(1j * h))))
+        anchors[node] = mean
+    return anchors
