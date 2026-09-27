@@ -566,7 +566,7 @@ def test_huber_irls_reports_converged_after_several_rounds() -> None:
 
     assert refinement.IRLS_POSITION_TOL_PX == 1e-9
     assert refinement.IRLS_KAPPA_TOL == 1e-12
-    assert refinement.IRLS_MAX_ROUNDS == 100
+    assert refinement.IRLS_MAX_ROUNDS == 500
     aligned, placement, edges, _, _, _ = _wrong_edge_world()
 
     result = refine_poses(aligned, placement, edges, PPM, SHAPES)

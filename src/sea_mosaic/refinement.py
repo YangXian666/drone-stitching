@@ -47,7 +47,10 @@ HUBER_F_SCALE = 1.345  # Huber constant for 95% efficiency under normal noise
 # optimization_status).
 IRLS_POSITION_TOL_PX = 1e-9
 IRLS_KAPPA_TOL = 1e-12
-IRLS_MAX_ROUNDS = 100
+# data/ (52 images, 184 pairs) needs 235-237 rounds to meet the rule above; 500 is ~2x
+# that, rounded up. Measured on one dataset, not a theoretical bound -- re-check on the
+# 700-image dataset (see CLAUDE.md's Stage A-D 真實資料驗收).
+IRLS_MAX_ROUNDS = 500
 
 _PARAMS_PER_NODE = 2  # m_x, m_y
 
