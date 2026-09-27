@@ -40,7 +40,7 @@ class GlobalTransforms:
     homography chain multiplication — see CLAUDE.md architectural constraint 4)."""
 
     transforms: dict[int, np.ndarray]  # image_index -> 3x3 H_image_to_mosaic
-    reference_index: int
+    reference_index: int | None  # None for the north-up frame of global_poses (no reference image)
     optimization_status: str
     residual_error: float  # np.nan if the optimizer residual is unavailable
 
