@@ -10,6 +10,35 @@ import numpy as np
 from sea_mosaic.types import WarpedImages, WarpedMasks
 
 
+def _distance_weight(mask: np.ndarray) -> np.ndarray:
+    """Distance-transform feathering weight for one warped mask (float32, 0 outside it).
+
+    Runs with OpenCV's IPP acceleration disabled, restoring the caller's IPP setting
+    afterwards (it is process-global state). OpenCV 5.0.0's IPP distanceTransform(DIST_L2,
+    DIST_MASK_PRECISE) path was non-deterministic -- identical inputs gave different
+    weights from run to run, flipping mosaic pixels that sit on a .5 rounding boundary --
+    and not exact (up to 1.9e-6 off the exact Euclidean distance). With IPP off, 40
+    pipeline runs in 5 fresh processes gave one mosaic, identical to the one from
+    scipy's exact EDT, at about the same speed (0.40 s vs 0.37 s on a 116 Mpx canvas).
+    Limiting OpenCV to one thread did NOT help once OpenCV had already run
+    multi-threaded in the process (see CLAUDE.md for the full investigation).
+
+    cv2.distanceTransform has no zero pixel to measure to when a mask has no black border
+    at all (its nonzero region exactly fills the array) -- it then returns an
+    overflow-style sentinel (~1.8e19), not a real distance. Clip to the mask's own
+    diagonal: any genuine distance-to-boundary value is bounded by roughly half the
+    shorter side, so the full diagonal is a safe, always-larger cap that never affects a
+    real (bordered) mask's values, only this sentinel.
+    """
+    previous_use_ipp = cv2.ipp.useIPP()
+    cv2.ipp.setUseIPP(False)
+    try:
+        raw_weight = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    finally:
+        cv2.ipp.setUseIPP(previous_use_ipp)
+    return np.minimum(raw_weight, float(np.hypot(*mask.shape)))
+
+
 def blend_images(
     warped_images: WarpedImages,
     warped_masks: WarpedMasks,
@@ -33,16 +62,7 @@ def blend_images(
 
     weights = {}
     for index in indices:
-        mask = warped_masks.masks[index]
-        raw_weight = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        # cv2.distanceTransform has no zero pixel to measure to when a mask has no
-        # black border at all (its nonzero region exactly fills the array) -- it then
-        # returns an overflow-style sentinel (~1.8e19), not a real distance. Clip to the
-        # mask's own diagonal: any genuine distance-to-boundary value is bounded by
-        # roughly half the shorter side, so the full diagonal is a safe, always-larger
-        # cap that never affects a real (bordered) mask's values, only this sentinel.
-        max_possible_distance = float(np.hypot(*mask.shape))
-        weights[index] = np.minimum(raw_weight, max_possible_distance)
+        weights[index] = _distance_weight(warped_masks.masks[index])
 
     total_weight = np.zeros(canvas_size, dtype=np.float64)
     for index in indices:
@@ -93,9 +113,7 @@ def blend_images_streaming(
     weight_sum = np.zeros(canvas_size, dtype=np.float64)
 
     for _index, warped_image, warped_mask in warped_stream:
-        raw_weight = cv2.distanceTransform(warped_mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-        max_possible_distance = float(np.hypot(*warped_mask.shape))
-        weight = np.minimum(raw_weight, max_possible_distance)
+        weight = _distance_weight(warped_mask)
         weight_sum += weight
         weighted_sum += weight[:, :, np.newaxis] * warped_image.astype(np.float64)
 

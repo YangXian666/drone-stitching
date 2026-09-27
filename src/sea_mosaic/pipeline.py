@@ -1,35 +1,24 @@
-"""Pipeline entrypoint: estimate -> compose -> warp -> blend -> evaluate metrics."""
+"""Pipeline entrypoint: estimate -> global poses (Stage A->D) -> warp -> blend -> evaluate metrics."""
 
 from __future__ import annotations
 
+import logging
 import time
 
 import numpy as np
 import pandas as pd
 
 from sea_mosaic.blend import blend_images_streaming
-from sea_mosaic.compose import compose_global_transforms
 from sea_mosaic.config import PipelineConfig
-from sea_mosaic.estimate import default_inlier_count_reference, match_pair, sequential_pairs
+from sea_mosaic.estimate import match_pair, sequential_pairs
 from sea_mosaic.geo.camera import CameraIntrinsics, CameraPose
-from sea_mosaic.geo.projection import estimate_pixels_per_meter
+from sea_mosaic.global_poses import GlobalPoseEstimate, estimate_global_poses
 from sea_mosaic.matcher import Matcher
 from sea_mosaic.metrics import compute_seam_error_streaming, evaluate_stitching_metrics
 from sea_mosaic.types import GlobalTransforms, PairResult, ProcessStats
 from sea_mosaic.warp import compute_canvas_size, warp_images_streaming
 
-# A homography has 8 degrees of freedom; 4 point correspondences (8 equations) is the
-# mathematical minimum needed to determine one uniquely. Below this threshold, the
-# system is underdetermined -- there's no meaningful sense in which a result could even
-# be evaluated for reliability, it's arbitrary by construction.
-#
-# This threshold does NOT claim that >=4 inliers means the homography IS reliable.
-# CLAUDE.md's Check A diagnostic already proved the opposite: even a well-determined,
-# high-inlier edge (inlier_count=717, far above this floor) can still get amplified into
-# a collapsed result once folded into the joint pose-graph optimization. "Solvable" and
-# "trustworthy" are different claims; this constant only rules out the specific failure
-# mode of "there wasn't even enough data to ask the question at all."
-_MIN_INLIERS_FOR_DETERMINED_HOMOGRAPHY = 4
+logger = logging.getLogger(__name__)
 
 
 def _empty_process_stats(input_image_count: int, elapsed: float) -> ProcessStats:
@@ -46,6 +35,35 @@ def _empty_process_stats(input_image_count: int, elapsed: float) -> ProcessStats
     )
 
 
+def _single_image_transforms(index: int) -> GlobalTransforms:
+    """docs/task2.md §3.1: a single input image that can be output as-is is a success.
+    Stage A-D needs at least one pair (pixels_per_meter is estimated from pairs), so the
+    single-image case bypasses it: identity transform, the image itself is the frame."""
+    return GlobalTransforms(
+        transforms={index: np.eye(3)},
+        reference_index=index,
+        optimization_status="converged",
+        residual_error=float(np.nan),
+    )
+
+
+def _log_pose_estimate(estimate: GlobalPoseEstimate) -> None:
+    """metrics_df's columns are fixed by docs/task2.md, so why images got no pose is
+    reported here (see CLAUDE.md: run_pipeline's return signature is unchanged for now)."""
+    if estimate.failure_reason is not None:
+        logger.warning("global pose estimation: %s", estimate.failure_reason)
+    if estimate.node_failure_reasons:
+        logger.warning(
+            "images without a global pose: %s", dict(sorted(estimate.node_failure_reasons.items()))
+        )
+    hits = estimate.bound_hits
+    if hits is not None and (hits.position or hits.kappa):
+        # Guard rails only catch gross failure; every hit is a diagnostic signal.
+        logger.warning(
+            "Stage D guard rail hit: positions %s, kappa %s", sorted(hits.position), hits.kappa
+        )
+
+
 def run_pipeline(
     images: dict[int, np.ndarray],
     matcher: Matcher,
@@ -53,16 +71,27 @@ def run_pipeline(
     camera_intrinsics: dict[int, CameraIntrinsics] | None = None,
     camera_poses: dict[int, CameraPose] | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame]:
-    """Run the full estimate -> compose -> warp -> blend pipeline and evaluate metrics.
+    """Run the full estimate -> global poses -> warp -> blend pipeline and evaluate metrics.
 
     images are already-loaded arrays (image_index -> ndarray) -- run_pipeline's
     responsibility boundary is explicitly "receives already-loaded image arrays", not
     file IO. Loading from disk (io_utils.load_image/load_images, still stubs) is a
     separate, independently-scoped concern for the caller, not something run_pipeline
-    does on the caller's behalf (see CLAUDE.md).
+    does on the caller's behalf (see CLAUDE.md). The same holds for metadata: pass EXIF
+    lat/lon (gps_placement.load_exif_latlons) and, for heading_anchor_source="gimbal",
+    GimbalYawDegree (io_utils.load_gimbal_yaw) through config.
+
+    Global poses come from global_poses.estimate_global_poses (Stage A->D) in the north-up
+    pixel frame. An image counts as successful when it got a finite global pose AND its
+    warped mask contributes at least one pixel. estimate_global_poses already withholds a
+    pose from every image without a usable edge (metadata alone is not image evidence), so
+    no separate edge or anchor rule is needed here. Without GPS no image can be placed and
+    the run fails (the reason is logged). A single input image bypasses Stage A-D and is
+    output as-is (docs/task2.md §3.1).
 
     Returns (stitched_image, metrics_df), where metrics_df is the one-row DataFrame from
-    metrics.evaluate_stitching_metrics.
+    metrics.evaluate_stitching_metrics. stitched_image is an empty (0, 0, 3) array when no
+    image succeeded.
 
     camera_intrinsics / camera_poses are reserved parameters for a future direct
     georeferencing integration (see sea_mosaic.geo.camera / sea_mosaic.geo.direct); this
@@ -77,7 +106,7 @@ def run_pipeline(
         metrics_df = evaluate_stitching_metrics(
             pair_results=[],
             global_transforms=GlobalTransforms(
-                transforms={}, reference_index=config.reference_index,
+                transforms={}, reference_index=None,
                 optimization_status="failed", residual_error=np.nan,
             ),
             image_shapes={},
@@ -87,58 +116,40 @@ def run_pipeline(
         return np.zeros((0, 0, 3), dtype=np.uint8), metrics_df
 
     all_indices = sorted(images)
-    pairs = config.pairs if config.pairs is not None else sequential_pairs(images)
-
-    # --- estimate: run_pipeline is the system boundary, so a single bad pair (e.g.
-    # too few raw matches -> cv2.error from cv2.findHomography) is caught and skipped
-    # here, not allowed to crash the whole run. match_pair/estimate_all_pairs
-    # themselves stay untouched, simple, exception-free contracts.
     pair_results: list[PairResult] = []
-    for src_index, dst_index in pairs:
-        try:
-            pair_result = match_pair(
-                matcher, images[src_index], images[dst_index], src_index, dst_index,
-                ransac_threshold=config.ransac_threshold,
-            )
-        except Exception:
-            continue
-        pair_results.append(pair_result)
 
-    edges_touching: dict[int, list[PairResult]] = {}
-    for pair_result in pair_results:
-        edges_touching.setdefault(pair_result.src_index, []).append(pair_result)
-        edges_touching.setdefault(pair_result.dst_index, []).append(pair_result)
+    if input_image_count == 1:
+        global_transforms = _single_image_transforms(all_indices[0])
+    else:
+        pairs = config.pairs if config.pairs is not None else sequential_pairs(images)
 
-    def has_determined_edge(image_index: int) -> bool:
-        return any(
-            pr.inlier_count >= _MIN_INLIERS_FOR_DETERMINED_HOMOGRAPHY
-            for pr in edges_touching.get(image_index, [])
+        # --- estimate: run_pipeline is the system boundary, so a single bad pair (e.g.
+        # too few raw matches -> cv2.error from cv2.findHomography) is caught and skipped
+        # here, not allowed to crash the whole run. match_pair/estimate_all_pairs
+        # themselves stay untouched, simple, exception-free contracts.
+        for src_index, dst_index in pairs:
+            try:
+                pair_result = match_pair(
+                    matcher, images[src_index], images[dst_index], src_index, dst_index,
+                    ransac_threshold=config.ransac_threshold,
+                )
+            except Exception:
+                continue
+            pair_results.append(pair_result)
+
+        # --- global poses: Stage A->D. Edge filtering (>= 4 inliers, finite homography),
+        # pixels_per_meter and the Stage A edge weights are all decided inside
+        # estimate_global_poses; argument errors (heading_anchor_source vs gimbal_yaw_deg)
+        # raise there, data-dependent failures are reported.
+        estimate = estimate_global_poses(
+            pair_results,
+            {index: images[index].shape for index in all_indices},
+            config.latlons,
+            heading_anchor_source=config.heading_anchor_source,
+            gimbal_yaw_deg=config.gimbal_yaw_deg,
         )
-
-    # reference_index must always be discoverable by build_pose_graph's node_indices
-    # union, even with zero edges and no caller-supplied GPS anchor (a single-image
-    # "mosaic", or every edge above failing) -- this default is exactly what
-    # build_pose_graph already falls back to internally for an anchor-less node
-    # (identity at the origin), so it changes no computed value, it only makes the
-    # reference node discoverable instead of silently absent from the graph.
-    gps_positions = {config.reference_index: np.zeros(2), **(config.gps_positions or {})}
-
-    ref_height, ref_width = images[config.reference_index].shape[:2]
-    pixels_per_meter = estimate_pixels_per_meter(
-        altitude_m=config.altitude_m, dfov_deg=config.dfov_deg,
-        width_px=ref_width, height_px=ref_height,
-    )
-    inlier_count_reference = default_inlier_count_reference(pair_results)
-
-    global_transforms = compose_global_transforms(
-        pair_results,
-        gps_positions=gps_positions,
-        reference_index=config.reference_index,
-        pixels_per_meter=pixels_per_meter,
-        inlier_count_reference=inlier_count_reference,
-        gimbal_yaw=config.gimbal_yaw,
-        yaw_anchor_weight=config.yaw_anchor_weight,
-    )
+        _log_pose_estimate(estimate)
+        global_transforms = estimate.global_transforms
 
     if global_transforms.optimization_status != "converged":
         # Do not trust warp/blend to a GlobalTransforms the optimizer itself doesn't
@@ -153,8 +164,7 @@ def run_pipeline(
             process_stats=process_stats,
             method=matcher.name,
         )
-        placeholder = np.zeros_like(images[config.reference_index])
-        return placeholder, metrics_df
+        return np.zeros((0, 0, 3), dtype=np.uint8), metrics_df
 
     # --- warp + classify + blend (streaming): filter non-finite transforms BEFORE
     # canvas sizing, so one bad transform can't poison compute_canvas_size's shared
@@ -163,17 +173,14 @@ def run_pipeline(
     # all-black mask, already correctly excluded below by the "must have >=1 nonzero
     # pixel" rule; no separate isolation mechanism is needed for that case.
     #
-    # This used to be three separate passes over all N images (warp everything, THEN
-    # classify each by inspecting the fully materialized warped_masks dict, THEN blend
-    # only the survivors) -- each pass needing every image's canvas-sized warped data
-    # alive at once (O(N * canvas_size)). It is now one fused streaming pass:
-    # warp_images_streaming yields one image at a time, _successful_only classifies it
-    # immediately (discarding a failed image's warped arrays right there -- they are
-    # never yielded onward, never touch blend_images_streaming's accumulator, and are
-    # not stored anywhere else in this function either) and forwards only survivors into
-    # blend_images_streaming, which folds each one into its running accumulator and lets
-    # it be freed before the next arrives. Peak memory is O(canvas_size), not
-    # O(N * canvas_size) -- see CLAUDE.md's streaming-accumulator backlog item.
+    # One fused streaming pass: warp_images_streaming yields one image at a time,
+    # _successful_only classifies it immediately (discarding a failed image's warped
+    # arrays right there -- they are never yielded onward, never touch
+    # blend_images_streaming's accumulator, and are not stored anywhere else in this
+    # function either) and forwards only survivors into blend_images_streaming, which
+    # folds each one into its running accumulator and lets it be freed before the next
+    # arrives. Peak memory is O(canvas_size), not O(N * canvas_size) -- see CLAUDE.md's
+    # streaming-accumulator backlog item.
     usable_transforms = {
         index: transform
         for index, transform in global_transforms.transforms.items()
@@ -196,22 +203,9 @@ def run_pipeline(
         usable_shapes = {index: image.shape[:2] for index, image in usable_images.items()}
         canvas_size = compute_canvas_size(usable_shapes, usable_global_transforms)
 
-        # is-reference / has-determined-edge / has-anchor are all computable from
-        # pair_results/config alone, independent of any warped pixel data -- precomputed
-        # once here so the streaming loop below only has to check the ONE thing that
-        # genuinely requires the warped mask: whether it ended up non-empty.
-        structurally_qualifies = {
-            index: (
-                index == config.reference_index
-                or has_determined_edge(index)
-                or (config.gps_positions is not None and index in config.gps_positions)
-            )
-            for index in usable_transforms
-        }
-
         def _successful_only(stream):
             for index, warped_image, warped_mask in stream:
-                if structurally_qualifies[index] and np.any(warped_mask > 0):
+                if np.any(warped_mask > 0):
                     successful_indices.add(index)
                     yield index, warped_image, warped_mask
                 # else: warped_image/warped_mask fall out of scope right here -- never

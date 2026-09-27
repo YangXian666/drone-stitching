@@ -4,30 +4,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-
-import numpy as np
+from typing import Literal
 
 
 @dataclass
 class PipelineConfig:
-    """Tunable parameters for a single run_pipeline invocation.
+    """Tunable parameters for a single run_pipeline invocation. Nothing is required.
 
-    altitude_m / dfov_deg are required with no default -- they feed
-    geo.projection.estimate_pixels_per_meter, and (like pixels_per_meter itself, see
-    compose.py/CLAUDE.md) are camera/flight-specific numbers with no sensible universal
-    default; omitting them fails at PipelineConfig construction time, not partway
-    through run_pipeline. Everything else here is optional and defaults to None/the
-    existing baseline behavior, matching build_pose_graph/compose_global_transforms's
-    own optionality for the same parameters.
+    Global poses come from global_poses.estimate_global_poses (Stage A->D), which needs no
+    flight altitude or field of view: pixels_per_meter is estimated from the data. The old
+    altitude_m / dfov_deg / reference_index / gps_positions / gimbal_yaw /
+    yaw_anchor_weight fields belonged to the removed joint pose-graph optimization and no
+    longer exist (see CLAUDE.md).
+
+    latlons: EXIF-sourced (lat, lon) per image index -- pass the output of
+        gps_placement.load_exif_latlons, which already drops coordinates that exist only in
+        DJI XMP. Without GPS no image can be placed and the run is reported as failed.
+    heading_anchor_source: absolute heading anchors for Stage A -- "gps" (GPS track bearing,
+        no DJI metadata), "gimbal" (GimbalYawDegree; requires gimbal_yaw_deg) or "none".
+    gimbal_yaw_deg: GimbalYawDegree per image index in degrees (io_utils.load_gimbal_yaw).
+        Used only, and required, with heading_anchor_source="gimbal"; giving it with any
+        other source is an error, never silently ignored. Both checks live in
+        estimate_global_poses, not here, so there is one place that enforces them.
+    pairs: image pairs to match; None means consecutive-neighbour pairs.
+    loops: image-index loops for metrics.compute_cycle_loop_error.
     """
 
-    altitude_m: float
-    dfov_deg: float
     ransac_threshold: float = 3.0
-    reference_index: int = 0
     output_dir: Path | None = None
-    gps_positions: dict[int, np.ndarray] | None = None
-    gimbal_yaw: dict[int, float] | None = None
-    yaw_anchor_weight: float | None = None
+    latlons: dict[int, tuple[float, float]] | None = None
+    heading_anchor_source: Literal["gps", "gimbal", "none"] = "gps"
+    gimbal_yaw_deg: dict[int, float] | None = None
     pairs: list[tuple[int, int]] | None = None
     loops: list[list[int]] | None = None

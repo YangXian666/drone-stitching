@@ -46,9 +46,18 @@ from sea_mosaic.rotation_averaging import (
 )
 from sea_mosaic.types import GlobalTransforms, PairResult
 
-# 4 is the minimum number of point correspondences that determine a homography (8 degrees
-# of freedom). It says "solvable", not "trustworthy" (see CLAUDE.md: an edge far above 4
-# inliers can still be wrong).
+# A homography has 8 degrees of freedom; 4 point correspondences (8 equations) is the
+# mathematical minimum needed to determine one uniquely. Below this threshold, the
+# system is underdetermined -- there's no meaningful sense in which a result could even
+# be evaluated for reliability, it's arbitrary by construction.
+#
+# This threshold does NOT claim that >=4 inliers means the homography IS reliable.
+# CLAUDE.md's Check A diagnostic already proved the opposite: even a well-determined,
+# high-inlier edge (inlier_count=717, far above this floor) can still get amplified into
+# a collapsed result once folded into a joint optimization. "Solvable" and "trustworthy"
+# are different claims; this constant only rules out the specific failure mode of "there
+# wasn't even enough data to ask the question at all." (Moved here from pipeline.py,
+# which no longer filters edges itself.)
 MIN_INLIERS_FOR_DETERMINED_HOMOGRAPHY = 4
 
 HEADING_ANCHOR_SOURCES = ("gps", "gimbal", "none")

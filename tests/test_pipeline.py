@@ -1,21 +1,22 @@
-"""Unit tests for sea_mosaic.pipeline.run_pipeline.
+"""Unit tests for sea_mosaic.pipeline.run_pipeline (Stage A->D global poses).
 
-run_pipeline's job here is tested at the ORCHESTRATION level: given a scripted Matcher
-(no real SIFT) and, where needed, a mocked compose_global_transforms, does run_pipeline
-correctly classify images (success/partial_success/failed per docs/task2.md), isolate
-per-pair and per-image failures without crashing, and wire pixels_per_meter/
-inlier_count_reference/metrics correctly? This mirrors the same layering principle used
-throughout this project (fake Matcher for match_pair's RANSAC logic, synthetic data for
-warp/blend geometry): each test isolates ONE claim, not "does the whole real pipeline
-produce a good-looking mosaic".
+run_pipeline is tested at the ORCHESTRATION level: does it classify images correctly
+(success/partial_success/failed per docs/task2.md), isolate per-pair and per-image
+failures without crashing, handle the single-image and no-GPS cases, forward the
+heading-anchor configuration, and log why images got no pose? Stage A-D itself is tested
+in tests/test_global_poses.py and the per-stage test files.
 
-All test data is hand-built (no np.random). Images are tiny (3x3 or 5x5) arrays tagged
-with their own index value, recognized by the scripted matcher below -- no real image
-content or SIFT is involved anywhere in this file.
+Most tests use tests/synthetic_camera.py's PipelineScene: small (60x80) images rendered
+from a ground texture through a pinhole camera, exact correspondences served by
+SceneMatcher, and EXIF-style lat/lon -- all mutually consistent (checked in
+tests/test_synthetic_scene.py). Tests that mock estimate_global_poses out (they are about
+what run_pipeline does with a given GlobalTransforms) keep the older, simpler tagged-image
+helpers: there the image content never reaches pose estimation.
 """
 
 from __future__ import annotations
 
+import logging
 import pickle
 import tracemalloc
 from pathlib import Path
@@ -25,253 +26,310 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import sea_mosaic.pipeline as pipeline_module
 from sea_mosaic.config import PipelineConfig
-from sea_mosaic.estimate import default_inlier_count_reference
-from sea_mosaic.geo.projection import estimate_pixels_per_meter
+from sea_mosaic.global_poses import GlobalPoseEstimate
 from sea_mosaic.matcher import MatchResult
 from sea_mosaic.pipeline import run_pipeline
+from sea_mosaic.refinement import BoundHits
 from sea_mosaic.types import GlobalTransforms
+from synthetic_camera import (
+    PIPELINE_FOCAL_PX,
+    PIPELINE_IMAGE_SHAPE,
+    SceneMatcher,
+    SyntheticCamera,
+    ground_texture,
+    pipeline_scene,
+)
+
+ALTITUDE = 100.0
+
+
+# ---------------------------------------------------------------------------
+# Scene helpers
+# ---------------------------------------------------------------------------
+
+
+def _line_cameras(n: int, step_m: float = 13.4) -> dict[int, SyntheticCamera]:
+    """One flight line like real line B: course 83 deg, camera yaw 70.8 deg."""
+    course = np.radians(83.0)
+    return {
+        k: SyntheticCamera(k * step_m * np.sin(course), k * step_m * np.cos(course), ALTITUDE, 70.8) for k in range(n)
+    }
+
+
+def _scene(n: int):
+    return pipeline_scene(_line_cameras(n))
+
+
+def _config(scene, **overrides) -> PipelineConfig:
+    fields = dict(latlons=dict(scene.latlons), pairs=list(scene.pairs))
+    fields.update(overrides)
+    return PipelineConfig(**fields)
+
+
+def _isolated_node_scene():
+    """5 images on a line; node 2 is sandwiched between two edges that both fail (2
+    correspondences -> cv2.findHomography raises inside match_pair), so it has no usable
+    edge. A (1, 3) bypass keeps {3, 4} connected to {0, 1}, so node 2 is the only image
+    without image evidence (without the bypass {3, 4} would be a separate component --
+    fine for the new architecture, but it would test something else)."""
+    scene = _scene(5)
+    matcher = SceneMatcher(scene, fail_pairs={(1, 2), (2, 3)})
+    pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (1, 3)]
+    return scene, matcher, pairs
+
+
+def _estimate_returning(global_transforms: GlobalTransforms, **overrides) -> GlobalPoseEstimate:
+    """A GlobalPoseEstimate wrapping a hand-built GlobalTransforms, for tests that mock
+    estimate_global_poses out."""
+    fields = dict(
+        global_transforms=global_transforms,
+        failure_reason=None,
+        node_failure_reasons={},
+        heading_anchor_source="gps",
+        pixels_per_meter=1.0,
+        kappa=1.0,
+        component_offsets_rad={},
+        bound_hits=BoundHits(),
+        skipped_edges={},
+        term_rms={},
+        irls_rounds=1,
+    )
+    fields.update(overrides)
+    return GlobalPoseEstimate(**fields)
+
+
+# --- tagged-image helpers, only for tests that mock estimate_global_poses --------------
 
 
 def _tagged_image(index: int, size: int = 3) -> np.ndarray:
     """A tiny image array whose every pixel equals its own index -- lets
-    _ScriptedMatcher below identify which pair it's being asked to match, without any
-    real image content or SIFT involved."""
+    _ScriptedMatcher identify the pair without any real image content."""
     return np.full((size, size, 3), index, dtype=np.uint8)
 
 
 def _good_match_result(tx: float = 3.0, ty: float = 2.0) -> MatchResult:
-    """5 well-spread points (4 corners + center, not collinear), all consistent with a
-    pure translation -- cv2.findHomography/RANSAC accepts all 5 as inliers (verified
-    empirically: real cv2.findHomography never reports fewer inliers than the minimal
-    4-point sample it fits, so a small, fully-consistent point set like this reliably
-    gives inlier_count == match_count == 5, not something lower)."""
+    """5 well-spread points consistent with a pure translation (RANSAC keeps all 5)."""
     src = np.array([[10.0, 10.0], [50.0, 10.0], [10.0, 50.0], [50.0, 50.0], [30.0, 30.0]])
-    dst = src + np.array([tx, ty])
-    return MatchResult(src_points=src, dst_points=dst, scores=None)
-
-
-def _too_few_points_match_result() -> MatchResult:
-    """Only 2 correspondences -- below the mathematical minimum of 4 for a homography.
-    match_pair's cv2.findHomography call raises a real cv2.error for this (verified
-    empirically), not a contrived/injected exception. This is the SAME real mechanism
-    behind both the per-pair error-isolation tests and the "no valid edge" classification
-    tests below -- match_count<4 (raises) and inlier_count<4 (reported by a successful
-    RANSAC call) turned out, empirically, to be the same practical boundary: a
-    successful cv2.findHomography call on real data never reports fewer than 4 inliers."""
-    return MatchResult(
-        src_points=np.array([[10.0, 10.0], [20.0, 20.0]]),
-        dst_points=np.array([[13.0, 12.0], [23.0, 22.0]]),
-        scores=None,
-    )
+    return MatchResult(src_points=src, dst_points=src + np.array([tx, ty]), scores=None)
 
 
 class _ScriptedMatcher:
-    """Matcher test double: returns a pre-scripted MatchResult per (src_index,
-    dst_index) pair, identifying the pair from _tagged_image's own pixel value (not
-    from any real feature content)."""
-
     name = "scripted-test-matcher"
 
     def __init__(self, results_by_pair: dict[tuple[int, int], MatchResult]) -> None:
         self._results_by_pair = results_by_pair
 
     def match(self, image_a: np.ndarray, image_b: np.ndarray) -> MatchResult:
-        src_index = int(image_a.flat[0])
-        dst_index = int(image_b.flat[0])
-        return self._results_by_pair[(src_index, dst_index)]
+        return self._results_by_pair[(int(image_a.flat[0]), int(image_b.flat[0]))]
 
 
-def _base_config(**overrides) -> PipelineConfig:
-    defaults = dict(altitude_m=100.0, dfov_deg=82.9)
-    defaults.update(overrides)
-    return PipelineConfig(**defaults)
+# ---------------------------------------------------------------------------
+# A: happy path and the single-image special case
+# ---------------------------------------------------------------------------
 
 
-# --- A: happy-path classification -------------------------------------------------------
+@pytest.mark.parametrize("source", ["gps", "gimbal", "none"])
+def test_run_pipeline_all_images_well_matched_is_success(source: str) -> None:
+    scene = _scene(6)
+    gimbal = scene.gimbal_yaw_deg if source == "gimbal" else None
 
-
-def test_run_pipeline_all_images_well_matched_is_success() -> None:
-    images = {i: _tagged_image(i) for i in range(3)}
-    matcher = _ScriptedMatcher(
-        {(0, 1): _good_match_result(), (1, 2): _good_match_result()}
+    mosaic, metrics_df = run_pipeline(
+        scene.images, SceneMatcher(scene), _config(scene, heading_anchor_source=source, gimbal_yaw_deg=gimbal)
     )
 
-    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
-
     assert metrics_df["pipeline_status"][0] == "success"
-    assert metrics_df["successful_image_count"][0] == 3
+    assert metrics_df["successful_image_count"][0] == 6
     assert metrics_df["failed_image_count"][0] == 0
+    assert mosaic.ndim == 3 and mosaic.shape[0] > PIPELINE_IMAGE_SHAPE[0]
 
 
-def test_run_pipeline_single_image_is_success() -> None:
-    images = {0: _tagged_image(0)}
-    matcher = _ScriptedMatcher({})
+def test_run_pipeline_mosaic_is_the_north_up_ground_texture() -> None:
+    """End to end against independent truth: each mosaic pixel shows the ground texture
+    at the point the north-up frame puts there (x = ppm*E, y = -ppm*N, origin at node 0,
+    shifted by the canvas origin computed from the TRUE image footprints). Checks the
+    frame convention and the whole chain, not only the classification."""
+    scene = _scene(6)
+    mosaic, metrics_df = run_pipeline(scene.images, SceneMatcher(scene), _config(scene))
+    assert metrics_df["pipeline_status"][0] == "success"
 
-    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    ppm = PIPELINE_FOCAL_PX / ALTITUDE
+    origin = scene.cameras[0]
+    rows, cols = PIPELINE_IMAGE_SHAPE
+    corners = []
+    for camera in scene.cameras.values():
+        # true pose: rotation by the compass yaw about the image centre, centre at the camera
+        yaw = np.radians(camera.yaw_deg)
+        R = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
+        centre = ppm * np.array([camera.east_m - origin.east_m, -(camera.north_m - origin.north_m)])
+        local = np.array([[0, 0], [cols, 0], [0, rows], [cols, rows]], float) - [cols / 2, rows / 2]
+        corners.append(local @ R.T + centre)
+    min_xy = np.min(np.vstack(corners), axis=0)
+
+    v, u = np.nonzero(mosaic.sum(axis=2) > 0)
+    x, y = u + min_xy[0], v + min_xy[1]
+    expected = ground_texture(x / ppm + origin.east_m, -y / ppm + origin.north_m)
+    interior = (u > 2) & (v > 2) & (u < mosaic.shape[1] - 3) & (v < mosaic.shape[0] - 3)
+    error = np.abs(mosaic[v, u].astype(float) - expected)[interior]
+    # Median, not mean. Measured when written: median 0.354, mean 3.51. The mean is
+    # dominated by the 1-2 px band along every image edge (mean error 8.07 there):
+    # bilinear warping blends the out-of-image black into edge pixels, which keep a small
+    # blend weight (a warp/blend property, see CLAUDE.md). 2+ px from any edge the error
+    # is 0.31-0.44, the single-image resampling floor (0.34). Against the same mosaic,
+    # wrong frame conventions give medians of 29.5 (y = +ppm*N), 40.7 (x = -ppm*E), 14.2
+    # (rotated 5 deg), 5.9 (1 px shift), 2.3 (0.5 px shift), 1.8 (scale off by 1%).
+    assert np.median(error) < 1.0
+
+
+def test_run_pipeline_single_image_is_output_as_is_with_nan_residual() -> None:
+    """docs/task2.md §3.1: one input image that can be output is a success. Stage A-D
+    (which needs pairs) is bypassed: no matching, no estimate_global_poses call; the
+    GlobalTransforms is identity, converged, residual_error NaN, reference_index = the
+    image's own index."""
+    scene = _scene(1)
+    image = scene.images[0]
+    matcher = MagicMock()
+    matcher.name = "never-called"
+
+    with patch.object(pipeline_module, "estimate_global_poses") as mock_estimate, patch.object(
+        pipeline_module, "evaluate_stitching_metrics", wraps=pipeline_module.evaluate_stitching_metrics
+    ) as spy_metrics:
+        mosaic, metrics_df = run_pipeline({7: image}, matcher, PipelineConfig())
 
     assert metrics_df["pipeline_status"][0] == "success"
     assert metrics_df["successful_image_count"][0] == 1
+    assert np.array_equal(mosaic, image)
+    assert matcher.match.call_count == 0
+    assert mock_estimate.call_count == 0
+    gt = spy_metrics.call_args.kwargs["global_transforms"]
+    assert np.array_equal(gt.transforms[7], np.eye(3))
+    assert gt.reference_index == 7
+    assert gt.optimization_status == "converged"
+    assert np.isnan(gt.residual_error)
 
 
-# --- B: the three classification paths (edge / GPS anchor / neither) -------------------
+# ---------------------------------------------------------------------------
+# B: per-image classification (image evidence is required; metadata is not enough)
+# ---------------------------------------------------------------------------
 
 
-def _isolated_node_scenario() -> tuple[dict[int, np.ndarray], _ScriptedMatcher, list[tuple[int, int]]]:
-    """5 images; node 2 is sandwiched between two edges that BOTH fail (too few
-    points), isolating it from feature-based positioning entirely, while nodes 1 and 3
-    each keep one good edge of their own (to 0 and 4 respectively) and are unaffected.
+def test_run_pipeline_image_without_edge_or_gps_fails_but_others_succeed(caplog) -> None:
+    scene, matcher, pairs = _isolated_node_scene()
+    latlons = {k: v for k, v in scene.latlons.items() if k != 2}
 
-    Includes a (1,3) bypass edge, added after a real analytic-Jacobian regression
-    investigation found that without it, {3,4} form a fully disconnected, unanchored
-    subgraph (no edge and no GPS anchor ties them back to node 0's anchored component,
-    since both edges through node 2 fail and this scenario supplies no gps_positions) --
-    a genuine flat/null direction in the pose-graph cost function (any rigid transform of
-    {3,4} together leaves their own mutual edge residual unchanged), not a bug in any
-    particular Jacobian-computation method. Verified directly: node 3's residual against
-    the (3,4) edge constraint was ~1e-10 (a fully valid local optimum) in BOTH the old
-    (numerical-Jacobian) and new (analytic-Jacobian) results, yet the two runs landed at
-    wildly different absolute poses for {3,4} (scale~1 vs scale~4.68, ~244deg apart) --
-    the solver's tiny floating-point path differences pick a different point along that
-    same flat direction. This is the same pose-graph degeneracy family already recorded
-    in CLAUDE.md's large-scale GPS-anchor-coupled collapse findings, just a different
-    manifestation (answer non-uniqueness from a structurally underconstrained subgraph,
-    not from anchor-vs-edge coupling) -- see CLAUDE.md's 已知的限制 for the full story.
-    A golden-fixture regression test's whole premise is "the output should be unique and
-    comparable"; that premise never held for this topology to begin with, independent of
-    any Jacobian change, so the fix is the topology (reconnect {3,4} to the anchored
-    component via a bypass edge that skips over node 2, exactly as (0,1)/(3,4) already
-    do), not reverting the Jacobian or accepting a non-deterministic golden comparison.
-    The bypass edge does not give node 2 itself any edge or anchor -- it stays genuinely
-    isolated, and every existing classification assertion using this fixture (which node
-    succeeds/fails) is unaffected, verified by rerunning them after this change."""
-    images = {i: _tagged_image(i) for i in range(5)}
-    matcher = _ScriptedMatcher(
-        {
-            (0, 1): _good_match_result(),
-            (1, 2): _too_few_points_match_result(),
-            (2, 3): _too_few_points_match_result(),
-            (3, 4): _good_match_result(),
-            (1, 3): _good_match_result(tx=6.0, ty=4.0),
-        }
+    with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
+        _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, latlons=latlons, pairs=pairs))
+
+    assert metrics_df["pipeline_status"][0] == "partial_success"
+    assert metrics_df["successful_image_count"][0] == 4
+    assert metrics_df["failed_image_indices"][0] == [2]
+    assert "{2: 'no_determined_edge'}" in caplog.text
+
+
+@pytest.mark.parametrize("source", ["gps", "gimbal"])
+def test_run_pipeline_image_with_gps_but_no_edge_still_fails(source: str) -> None:
+    """Expectation REVERSED from the old architecture, where a GPS anchor alone made an
+    image count as successful. Now metadata alone -- GPS, and in gimbal mode also a
+    heading -- is not image evidence, so node 2 fails either way."""
+    scene, matcher, pairs = _isolated_node_scene()
+    gimbal = scene.gimbal_yaw_deg if source == "gimbal" else None
+
+    _mosaic, metrics_df = run_pipeline(
+        scene.images, matcher, _config(scene, pairs=pairs, heading_anchor_source=source, gimbal_yaw_deg=gimbal)
     )
-    # run_pipeline defaults to sequential_pairs(images) when config.pairs is None, which
-    # would never query the (1,3) bypass above -- every caller must pass this pairs list
-    # through config.pairs explicitly for the bypass edge to actually take effect.
-    pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (1, 3)]
-    return images, matcher, pairs
-
-
-def test_run_pipeline_isolated_node_without_gps_anchor_fails_but_others_succeed() -> None:
-    images, matcher, pairs = _isolated_node_scenario()
-
-    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config(pairs=pairs))
 
     assert metrics_df["pipeline_status"][0] == "partial_success"
     assert metrics_df["successful_image_count"][0] == 4
     assert metrics_df["failed_image_indices"][0] == [2]
 
 
-def test_run_pipeline_isolated_node_with_gps_anchor_still_succeeds() -> None:
-    """The one case where option A (structural-only) and option B (quality-gated)
-    disagree: node 2 has no valid feature-based edge, but DOES have a GPS anchor --
-    per docs/task2.md 3.2's "reference/anchor image...算成功", it must still count."""
-    images, matcher, pairs = _isolated_node_scenario()
-    gps_positions = {2: np.array([0.0, 0.0])}
+def test_run_pipeline_mixed_failures_report_exactly_the_failed_images_and_reasons(caplog) -> None:
+    """Three different ways to fail in one run: node 2 sandwiched between two failed edges,
+    node 5 a dead end whose only edge fails (both "no_determined_edge"), node 4 with a good
+    edge but no GPS ("unlocated")."""
+    scene = pipeline_scene(_line_cameras(6))
+    matcher = SceneMatcher(scene, fail_pairs={(1, 2), (2, 3), (4, 5)})
+    pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (1, 3)]
+    latlons = {k: v for k, v in scene.latlons.items() if k != 4}
 
-    _mosaic, metrics_df = run_pipeline(
-        images, matcher, _base_config(gps_positions=gps_positions, pairs=pairs)
-    )
-
-    assert metrics_df["pipeline_status"][0] == "success"
-    assert metrics_df["successful_image_count"][0] == 5
-    assert metrics_df["failed_image_indices"][0] == []
-
-
-def test_run_pipeline_mixed_isolation_failed_image_indices_exactly_the_unrescued_one() -> None:
-    """Asymmetric graph, not a mirrored/repeated pattern: node 2 is isolated by being
-    SANDWICHED between two failed edges (both its neighbors otherwise have their own
-    good edges elsewhere); node 5 is isolated by being a DEAD END with only one edge,
-    which fails (there is no symmetric edge on its other side at all, unlike node 2).
-    Only the sandwiched one (2) gets a GPS anchor; the dead-end one (5) does not."""
-    images = {i: _tagged_image(i) for i in range(6)}
-    matcher = _ScriptedMatcher(
-        {
-            (0, 1): _good_match_result(),
-            (1, 2): _too_few_points_match_result(),
-            (2, 3): _too_few_points_match_result(),
-            (3, 4): _good_match_result(),
-            (4, 5): _too_few_points_match_result(),
-        }
-    )
-    gps_positions = {2: np.array([0.0, 0.0])}
-
-    _mosaic, metrics_df = run_pipeline(
-        images, matcher, _base_config(gps_positions=gps_positions)
-    )
+    with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
+        _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, latlons=latlons, pairs=pairs))
 
     assert metrics_df["pipeline_status"][0] == "partial_success"
-    assert metrics_df["successful_image_count"][0] == 5
-    assert metrics_df["failed_image_indices"][0] == [5]
+    assert metrics_df["successful_image_count"][0] == 3
+    assert metrics_df["failed_image_indices"][0] == [2, 4, 5]
+    assert "{2: 'no_determined_edge', 4: 'unlocated', 5: 'no_determined_edge'}" in caplog.text
 
 
-# --- C: whole-run failure paths ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# C: whole-run failure paths
+# ---------------------------------------------------------------------------
 
 
-def test_run_pipeline_only_reference_survives_is_failed() -> None:
-    images = {i: _tagged_image(i) for i in range(3)}
-    matcher = _ScriptedMatcher(
-        {
-            (0, 1): _too_few_points_match_result(),
-            (1, 2): _too_few_points_match_result(),
-        }
-    )
+def test_run_pipeline_no_usable_edge_is_failed(caplog) -> None:
+    """Replaces the old "only the reference image survives" test: that state no longer
+    exists. There is no reference image, and a pose needs a Stage C alignment edge whose
+    two endpoints both get poses, so a multi-image run poses either 0 or >= 2 images."""
+    scene = _scene(3)
+    matcher = SceneMatcher(scene, fail_pairs=set(scene.pairs))
 
-    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
+        mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene))
 
     assert metrics_df["pipeline_status"][0] == "failed"
-    assert metrics_df["successful_image_count"][0] == 1
-    assert metrics_df["failed_image_indices"][0] == [1, 2]
+    assert metrics_df["successful_image_count"][0] == 0
+    assert metrics_df["failed_image_indices"][0] == [0, 1, 2]
+    assert mosaic.shape == (0, 0, 3)
+    assert "pixels_per_meter_unavailable" in caplog.text
 
 
-def test_run_pipeline_not_converged_compose_forces_failed_and_skips_warp_blend() -> None:
-    """optimize_pose_graph's own not_converged status must not be trusted downstream --
-    run_pipeline treats it as a whole-run failure and must not call warp_images_streaming/
-    blend_images_streaming at all on a GlobalTransforms the optimizer itself doesn't
-    believe in.
+def test_run_pipeline_without_gps_is_failed_and_logs_why(caplog) -> None:
+    """Replaces the old "computes pixels_per_meter from altitude itself" test: there is no
+    altitude any more. Without GPS no image can be placed (agreed design), and the reason
+    is logged because metrics_df's columns are fixed."""
+    scene = _scene(4)
 
-    Patch targets updated from warp_images/blend_images to their streaming replacements
-    when run_pipeline was wired to call the streaming accumulator path (see CLAUDE.md's
-    streaming-accumulator backlog item) -- same test name, same assertions, same intent;
-    only the two patch-target strings changed, tracking what run_pipeline actually calls
-    now. Deliberately not left pointing at the old (no longer called) names: doing so
-    would have made mock_warp.call_count == 0 trivially true regardless of whether
-    run_pipeline's not-converged guard worked at all, since neither old name is on the
-    execution path anymore -- a silently gutted, always-green assertion, not a real one."""
+    with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
+        mosaic, metrics_df = run_pipeline(scene.images, SceneMatcher(scene), PipelineConfig(pairs=scene.pairs))
+
+    assert metrics_df["pipeline_status"][0] == "failed"
+    assert metrics_df["successful_image_count"][0] == 0
+    assert mosaic.shape == (0, 0, 3)
+    assert "global pose estimation: no_gps" in caplog.text
+    # matching still ran: its metrics stay meaningful without GPS
+    assert metrics_df["inlier_count"][0] > 0
+
+
+def test_run_pipeline_not_converged_forces_failed_and_skips_warp_blend() -> None:
+    """A Stage D not_converged status must not be trusted downstream: whole-run failure,
+    warp/blend never called, empty (0, 0, 3) output (changed from the old
+    zeros_like(reference image): there is no reference image any more)."""
     images = {i: _tagged_image(i) for i in range(2)}
     matcher = _ScriptedMatcher({(0, 1): _good_match_result()})
-
     not_converged = GlobalTransforms(
         transforms={0: np.eye(3), 1: np.eye(3)},
-        reference_index=0,
+        reference_index=None,
         optimization_status="not_converged",
         residual_error=np.nan,
     )
+    estimate = _estimate_returning(not_converged, failure_reason="refinement_not_converged")
 
-    with patch("sea_mosaic.pipeline.compose_global_transforms", return_value=not_converged):
-        with patch("sea_mosaic.pipeline.warp_images_streaming") as mock_warp:
-            with patch("sea_mosaic.pipeline.blend_images_streaming") as mock_blend:
-                _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    with patch.object(pipeline_module, "estimate_global_poses", return_value=estimate):
+        with patch.object(pipeline_module, "warp_images_streaming") as mock_warp:
+            with patch.object(pipeline_module, "blend_images_streaming") as mock_blend:
+                mosaic, metrics_df = run_pipeline(images, matcher, PipelineConfig())
 
     assert metrics_df["pipeline_status"][0] == "failed"
     assert metrics_df["successful_image_count"][0] == 0
     assert metrics_df["failed_image_indices"][0] == [0, 1]
+    assert mosaic.shape == (0, 0, 3)
     assert mock_warp.call_count == 0
     assert mock_blend.call_count == 0
 
 
 def test_run_pipeline_empty_input_is_failed_without_crashing() -> None:
-    _mosaic, metrics_df = run_pipeline({}, _ScriptedMatcher({}), _base_config())
+    _mosaic, metrics_df = run_pipeline({}, _ScriptedMatcher({}), PipelineConfig())
 
     assert metrics_df["pipeline_status"][0] == "failed"
     assert metrics_df["input_image_count"][0] == 0
@@ -279,159 +337,143 @@ def test_run_pipeline_empty_input_is_failed_without_crashing() -> None:
     assert np.isnan(metrics_df["avg_processing_time_per_image_sec"][0])
 
 
-# --- D: error isolation ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# D: error isolation
+# ---------------------------------------------------------------------------
 
 
 def test_run_pipeline_estimate_stage_pair_exception_is_isolated_not_fatal() -> None:
-    """(1,2) has too few points and makes match_pair raise a REAL cv2.error (not an
-    injected/mocked exception) -- run_pipeline must not crash; that edge is simply
-    excluded, node 2 (with no other edge and no GPS anchor) fails, node 0/1 succeed."""
-    images = {i: _tagged_image(i) for i in range(3)}
-    matcher = _ScriptedMatcher(
-        {(0, 1): _good_match_result(), (1, 2): _too_few_points_match_result()}
-    )
+    """(1, 2) gets 2 correspondences and makes match_pair raise a REAL cv2.error --
+    run_pipeline must not crash; that edge is excluded, node 2 (no other edge) fails,
+    nodes 0 and 1 succeed."""
+    scene = _scene(3)
+    matcher = SceneMatcher(scene, fail_pairs={(1, 2)})
 
-    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, pairs=[(0, 1), (1, 2)]))
 
     assert metrics_df["pipeline_status"][0] == "partial_success"
     assert metrics_df["successful_image_count"][0] == 2
     assert metrics_df["failed_image_indices"][0] == [2]
 
 
-def test_run_pipeline_nonfinite_transform_isolated_without_poisoning_other_images() -> None:
-    """Regression guard for the "contamination radius" problem found empirically while
-    designing this isolation: compute_canvas_size converts bounds via int(np.ceil(...)),
-    which raises ValueError on NaN/inf -- and if canvas_size were computed from ALL
-    images' transforms in one call, node 1's NaN transform would poison that single
-    shared computation for nodes 0 and 2 too, not just fail node 1 alone.
-
-    The fix is NOT a try/except around a per-image warp call (cv2.warpPerspective
-    itself never raises for bad matrices -- see the other test below): it's an
-    up-front np.all(np.isfinite(transform)) filter applied BEFORE canvas sizing, so a
-    non-finite transform is excluded from that shared computation entirely. This test
-    locks in that node 0 and node 2 still get a sane, uncorrupted mosaic despite node
-    1's transform being unusable."""
-    images = {0: _tagged_image(0, size=5), 1: _tagged_image(1, size=5), 2: _tagged_image(2, size=5)}
-    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
-
-    nan_transform = np.array([[np.nan, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    poisoned = GlobalTransforms(
-        transforms={
-            0: np.eye(3),
-            1: nan_transform,
-            2: np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
-        },
-        reference_index=0,
+def _poisoned_transforms(bad: np.ndarray) -> GlobalTransforms:
+    return GlobalTransforms(
+        transforms={0: np.eye(3), 1: bad, 2: np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])},
+        reference_index=None,
         optimization_status="converged",
-        residual_error=0.1,
+        residual_error=np.nan,
     )
 
-    with patch("sea_mosaic.pipeline.compose_global_transforms", return_value=poisoned):
-        mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+
+def test_run_pipeline_nonfinite_transform_isolated_without_poisoning_other_images() -> None:
+    """compute_canvas_size raises on NaN/inf; if the canvas were sized from ALL transforms
+    at once, node 1's NaN would poison it for nodes 0 and 2 too. The up-front
+    np.all(np.isfinite(transform)) filter excludes node 1 before canvas sizing."""
+    images = {k: _tagged_image(k, size=5) for k in range(3)}
+    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    nan_transform = np.array([[np.nan, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+
+    with patch.object(
+        pipeline_module, "estimate_global_poses", return_value=_estimate_returning(_poisoned_transforms(nan_transform))
+    ):
+        mosaic, metrics_df = run_pipeline(images, matcher, PipelineConfig())
 
     assert metrics_df["failed_image_indices"][0] == [1]
     assert metrics_df["successful_image_count"][0] == 2
     assert np.all(np.isfinite(mosaic.astype(np.float64)))
-    # canvas reflects only nodes 0 and 2's (5x5, offset by 10) footprints, not a NaN-
-    # corrupted computation -- small and sane, not degenerate
     assert mosaic.shape[0] <= 20 and mosaic.shape[1] <= 20
 
 
 def test_run_pipeline_finite_degenerate_transform_needs_no_special_isolation_mechanism() -> None:
-    """This test's point is NOT to verify some hidden try/except or pre-check catching
-    a warp failure -- it's the opposite: it locks in the empirical finding that
-    cv2.warpPerspective never raises for a finite-but-singular (scale=0) transform, it
-    silently produces an all-black warped image/mask. No new isolation mechanism is
-    needed for this case at all: it is already correctly handled by the ordinary
-    "warped_masks.masks[i] must have >=1 nonzero pixel to count as successful" rule
-    from part B's tests above. If this test ever starts failing because
-    cv2.warpPerspective's behavior changes to raise instead, that would be the actual
-    interesting finding -- not a bug in run_pipeline's isolation logic."""
-    images = {0: _tagged_image(0, size=5), 1: _tagged_image(1, size=5), 2: _tagged_image(2, size=5)}
+    """cv2.warpPerspective never raises for a finite-but-singular (scale=0) transform; it
+    produces an all-black mask, which the ordinary "mask must have >= 1 nonzero pixel"
+    rule already classifies as failed. If this starts failing because cv2 begins to
+    raise instead, that is the interesting finding, not a run_pipeline bug."""
+    images = {k: _tagged_image(k, size=5) for k in range(3)}
     matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    singular = np.array([[0.0, 0.0, 5.0], [0.0, 0.0, 5.0], [0.0, 0.0, 1.0]])
 
-    singular_transform = np.array([[0.0, 0.0, 5.0], [0.0, 0.0, 5.0], [0.0, 0.0, 1.0]])
-    degenerate = GlobalTransforms(
-        transforms={
-            0: np.eye(3),
-            1: singular_transform,
-            2: np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
-        },
-        reference_index=0,
-        optimization_status="converged",
-        residual_error=0.1,
-    )
-
-    with patch("sea_mosaic.pipeline.compose_global_transforms", return_value=degenerate):
-        _mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    with patch.object(
+        pipeline_module, "estimate_global_poses", return_value=_estimate_returning(_poisoned_transforms(singular))
+    ):
+        _mosaic, metrics_df = run_pipeline(images, matcher, PipelineConfig())
 
     assert metrics_df["failed_image_indices"][0] == [1]
     assert metrics_df["successful_image_count"][0] == 2
 
 
-# --- E: wiring correctness ---------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# E: wiring correctness
+# ---------------------------------------------------------------------------
 
 
 def test_run_pipeline_metrics_df_matches_computed_classification() -> None:
-    images, matcher, pairs = _isolated_node_scenario()
+    scene, matcher, pairs = _isolated_node_scene()
 
-    _mosaic, metrics_df = run_pipeline(images, matcher, _base_config(pairs=pairs))
+    _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, pairs=pairs))
 
     assert metrics_df["input_image_count"][0] == 5
-    assert (
-        metrics_df["stitch_success_rate"][0]
-        == pytest.approx(metrics_df["successful_image_count"][0] / 5)
-    )
+    assert metrics_df["stitch_success_rate"][0] == pytest.approx(metrics_df["successful_image_count"][0] / 5)
     assert isinstance(metrics_df, pd.DataFrame)
     assert len(metrics_df) == 1
 
 
-def test_run_pipeline_computes_pixels_per_meter_and_inlier_count_reference_itself() -> None:
-    """Neither value is a caller-supplied parameter (see CLAUDE.md/PipelineConfig) --
-    both must be computed internally from real inputs (altitude_m/dfov_deg and this
-    run's own pair_results), not passed through as arbitrary constants."""
-    images = {i: _tagged_image(i) for i in range(3)}
-    matcher = _ScriptedMatcher(
-        {(0, 1): _good_match_result(), (1, 2): _good_match_result()}
-    )
-    config = _base_config(altitude_m=120.0, dfov_deg=82.9)
+def test_run_pipeline_forwards_heading_configuration_to_estimate_global_poses() -> None:
+    """Replaces the old "degrades gracefully without gimbal_yaw" test. The default source
+    is "gps"; heading_anchor_source and gimbal_yaw_deg reach estimate_global_poses as
+    given, together with EXIF lat/lon and every image's shape."""
+    scene = _scene(4)
+    real = pipeline_module.estimate_global_poses
 
-    from sea_mosaic.compose import compose_global_transforms as real_compose
+    with patch.object(pipeline_module, "estimate_global_poses", wraps=real) as spy:
+        run_pipeline(scene.images, SceneMatcher(scene), _config(scene))
+        run_pipeline(
+            scene.images,
+            SceneMatcher(scene),
+            _config(scene, heading_anchor_source="gimbal", gimbal_yaw_deg=scene.gimbal_yaw_deg),
+        )
 
-    with patch("sea_mosaic.pipeline.compose_global_transforms", wraps=real_compose) as spy:
-        run_pipeline(images, matcher, config)
-
-    expected_ppm = estimate_pixels_per_meter(
-        altitude_m=120.0, dfov_deg=82.9, width_px=3, height_px=3
-    )
-    called_kwargs = spy.call_args.kwargs
-    assert called_kwargs["pixels_per_meter"] == pytest.approx(expected_ppm)
-    # both edges give inlier_count=5 (see _good_match_result's docstring) -> median=5
-    assert called_kwargs["inlier_count_reference"] == pytest.approx(5.0)
-
-
-def test_run_pipeline_without_gimbal_yaw_degrades_gracefully() -> None:
-    images = {i: _tagged_image(i) for i in range(3)}
-    matcher = _ScriptedMatcher(
-        {(0, 1): _good_match_result(), (1, 2): _good_match_result()}
-    )
-    config = _base_config(gimbal_yaw=None, yaw_anchor_weight=None)
-
-    _mosaic, metrics_df = run_pipeline(images, matcher, config)
-
-    assert metrics_df["pipeline_status"][0] == "success"
+    default_call, gimbal_call = spy.call_args_list
+    assert default_call.kwargs == {"heading_anchor_source": "gps", "gimbal_yaw_deg": None}
+    assert gimbal_call.kwargs == {"heading_anchor_source": "gimbal", "gimbal_yaw_deg": scene.gimbal_yaw_deg}
+    _pairs, shapes, latlons = default_call.args
+    assert shapes == {k: image.shape for k, image in scene.images.items()}
+    assert latlons == scene.latlons
 
 
-# --- F: streaming-accumulator integration regression (golden fixtures) ------------------
+def test_run_pipeline_gimbal_source_without_gimbal_data_raises() -> None:
+    """A configuration error, not a data problem: raised (by estimate_global_poses), not
+    reported as a failed run."""
+    scene = _scene(3)
+    with pytest.raises(ValueError, match="gimbal_yaw_deg"):
+        run_pipeline(scene.images, SceneMatcher(scene), _config(scene, heading_anchor_source="gimbal"))
+
+
+def test_run_pipeline_logs_stage_d_guard_rail_hits(caplog) -> None:
+    """Guard rails only catch gross failure; every hit is a diagnostic signal and must be
+    visible even though metrics_df has no column for it."""
+    images = {k: _tagged_image(k, size=5) for k in range(3)}
+    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    shift = np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    gt = GlobalTransforms({0: np.eye(3), 1: shift, 2: shift @ shift}, None, "converged", np.nan)
+    estimate = _estimate_returning(gt, bound_hits=BoundHits(position={1}, kappa=True))
+
+    with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
+        with patch.object(pipeline_module, "estimate_global_poses", return_value=estimate):
+            run_pipeline(images, matcher, PipelineConfig())
+
+    assert "Stage D guard rail hit: positions [1], kappa True" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# F: golden-fixture regression
+# ---------------------------------------------------------------------------
 #
-# These compare run_pipeline's output against fixtures captured from run_pipeline BEFORE
-# the streaming refactor (tests/fixtures/golden_pipeline/capture_golden.py) -- they only
-# ever READ those committed golden files, never regenerate them (an auto-regenerating
-# "golden" would silently launder a real regression into a new baseline instead of
-# catching it). Unlike the equivalence tests in stages 1-3 of this same redesign, these
-# are expected to PASS right now, before any pipeline.py change: they're regression
-# scaffolding, not a red-first check for a not-yet-written function -- their job starts
-# once pipeline.py's internals actually change.
+# These compare run_pipeline's output against committed fixtures
+# (tests/fixtures/golden_pipeline/, written by capture_golden.py) and only ever READ them
+# (an auto-regenerating "golden" would launder a regression into a new baseline). The
+# baseline was deliberately reset when run_pipeline switched to Stage A->D: the old
+# scenarios had no GPS and would all be "failed" now (see CLAUDE.md).
 
 _GOLDEN_DIR = Path(__file__).resolve().parent / "fixtures" / "golden_pipeline"
 _TIMING_COLUMNS = {"total_processing_time_sec", "avg_processing_time_per_image_sec"}
@@ -445,14 +487,8 @@ def _load_golden(name: str) -> tuple[np.ndarray, pd.DataFrame]:
 
 
 def _assert_metrics_df_matches_golden(new_df: pd.DataFrame, golden_df: pd.DataFrame) -> None:
-    """Excludes wall-clock timing columns (legitimately different every run, not a
-    regression signal). Everything else is asserted with a tight rtol rather than bare
-    == -- not because any column is expected to need it (none of reprojection_error_px/
-    inlier_ratio/inlier_count/cycle_loop_error_px/distortion derive from blended pixel
-    values at all, and seam_error was proven bit-exact, not tolerance-based, in the
-    compute_seam_error_streaming equivalence tests) but as a documented safety margin; a
-    genuine mismatch here needs investigating as a real difference, not silently
-    loosened further."""
+    """Excludes wall-clock timing columns; everything else with a tight rtol as a
+    documented safety margin -- a mismatch is a real difference to investigate."""
     assert list(new_df.columns) == list(golden_df.columns)
     for col in new_df.columns:
         if col in _TIMING_COLUMNS:
@@ -463,110 +499,98 @@ def _assert_metrics_df_matches_golden(new_df: pd.DataFrame, golden_df: pd.DataFr
         elif isinstance(golden_val, list):
             assert new_val == golden_val, f"{col}: {new_val!r} != {golden_val!r}"
         elif isinstance(golden_val, float):
-            assert new_val == pytest.approx(golden_val, rel=1e-9, abs=1e-12), (
-                f"{col}: {new_val!r} != {golden_val!r}"
-            )
+            assert new_val == pytest.approx(golden_val, rel=1e-9, abs=1e-12), f"{col}: {new_val!r} != {golden_val!r}"
         else:
             assert new_val == golden_val, f"{col}: {new_val!r} != {golden_val!r}"
 
 
-def test_run_pipeline_matches_golden_all_images_well_matched() -> None:
-    images = {i: _tagged_image(i) for i in range(3)}
+def golden_all_images_well_matched():
+    scene = _scene(6)
+    return scene.images, SceneMatcher(scene), _config(scene)
+
+
+def golden_isolated_node_without_edge():
+    scene, matcher, pairs = _isolated_node_scene()
+    return scene.images, matcher, _config(scene, pairs=pairs)
+
+
+def golden_nonfinite_transform_isolated():
+    images = {k: _tagged_image(k, size=5) for k in range(3)}
     matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    nan_transform = np.array([[np.nan, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    return images, matcher, PipelineConfig(), _estimate_returning(_poisoned_transforms(nan_transform))
+
+
+def test_run_pipeline_matches_golden_all_images_well_matched() -> None:
+    images, matcher, config = golden_all_images_well_matched()
     golden_mosaic, golden_metrics = _load_golden("all_images_well_matched")
 
-    mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    mosaic, metrics_df = run_pipeline(images, matcher, config)
 
     assert np.array_equal(mosaic, golden_mosaic)
     _assert_metrics_df_matches_golden(metrics_df, golden_metrics)
 
 
-def test_run_pipeline_matches_golden_isolated_node_without_gps_anchor() -> None:
-    """Exercises the classification path (edge/anchor-based) that has to move from a
-    post-hoc filter over a fully materialized warped_masks dict into an inline filter
-    over the warp stream -- the part of this integration that's more than a rename."""
-    images, matcher, pairs = _isolated_node_scenario()
-    golden_mosaic, golden_metrics = _load_golden("isolated_node_without_gps_anchor")
+def test_run_pipeline_matches_golden_isolated_node_without_edge() -> None:
+    images, matcher, config = golden_isolated_node_without_edge()
+    golden_mosaic, golden_metrics = _load_golden("isolated_node_without_edge")
 
-    mosaic, metrics_df = run_pipeline(images, matcher, _base_config(pairs=pairs))
+    mosaic, metrics_df = run_pipeline(images, matcher, config)
 
     assert np.array_equal(mosaic, golden_mosaic)
     _assert_metrics_df_matches_golden(metrics_df, golden_metrics)
 
 
 def test_run_pipeline_matches_golden_nonfinite_transform_isolated() -> None:
-    """Exercises the pre-warp finite-transform filter combined with mask-emptiness
-    classification -- distinct from the edge/anchor-based classification above."""
-    images = {0: _tagged_image(0, size=5), 1: _tagged_image(1, size=5), 2: _tagged_image(2, size=5)}
-    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
-    nan_transform = np.array([[np.nan, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
-    poisoned = GlobalTransforms(
-        transforms={
-            0: np.eye(3),
-            1: nan_transform,
-            2: np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
-        },
-        reference_index=0, optimization_status="converged", residual_error=0.1,
-    )
+    images, matcher, config, estimate = golden_nonfinite_transform_isolated()
     golden_mosaic, golden_metrics = _load_golden("nonfinite_transform_isolated")
 
-    with patch("sea_mosaic.pipeline.compose_global_transforms", return_value=poisoned):
-        mosaic, metrics_df = run_pipeline(images, matcher, _base_config())
+    with patch.object(pipeline_module, "estimate_global_poses", return_value=estimate):
+        mosaic, metrics_df = run_pipeline(images, matcher, config)
 
     assert np.array_equal(mosaic, golden_mosaic)
     _assert_metrics_df_matches_golden(metrics_df, golden_metrics)
 
 
-# --- G: warp/blend/seam_error memory scaling (NOT all of run_pipeline -- see the test's
-# own docstring for why compose_global_transforms is deliberately mocked out) -----------
+# ---------------------------------------------------------------------------
+# G: warp/blend/seam_error memory scaling (pose estimation mocked out)
+# ---------------------------------------------------------------------------
 
 
 def _synthetic_pipeline_scenario(
     n: int, total_span: float = 200.0, image_height: int = 10
 ) -> tuple[dict[int, np.ndarray], _ScriptedMatcher]:
-    """n images along a FIXED-length span (image width shrinks as n grows, same lesson
-    as the compute_seam_error_streaming fixture in stage 3) so canvas_size stays roughly
-    constant as n grows -- empirically verified against the REAL compose_global_transforms
-    (not assumed, since run_pipeline runs real pose-graph optimization, not a hand-fed
-    GlobalTransforms): mosaic.shape was IDENTICAL, (11, 201, 3), at both n=10 and n=100.
-    Sequential MatchResults (_good_match_result(tx=step, ty=0)) give consistent pairwise
-    translations regardless of the tiny image dimensions -- findHomography works on the
-    raw point correspondences, not on whether they fall within the image's own bounds."""
+    """n images along a FIXED-length span (image width shrinks as n grows) so canvas_size
+    stays roughly constant as n grows."""
     step = total_span / n
     image_width = max(2, int(round(step * 2)))
-    images = {
-        i: np.full((image_height, image_width, 3), (i % 200) + 1, dtype=np.uint8) for i in range(n)
-    }
-    matcher = _ScriptedMatcher(
-        {(i, i + 1): _good_match_result(tx=step, ty=0.0) for i in range(n - 1)}
-    )
+    images = {i: np.full((image_height, image_width, 3), (i % 200) + 1, dtype=np.uint8) for i in range(n)}
+    matcher = _ScriptedMatcher({(i, i + 1): _good_match_result(tx=step, ty=0.0) for i in range(n - 1)})
     return images, matcher
 
 
-def _hand_fed_global_transforms(n: int, total_span: float = 200.0) -> GlobalTransforms:
-    """A cheap, non-optimized GlobalTransforms matching _synthetic_pipeline_scenario's own
-    geometry exactly (translation by i*step), for mocking sea_mosaic.pipeline.
-    compose_global_transforms in the memory-scaling test below. See that test's docstring
-    for why: compose_global_transforms's real pose-graph solver has its own, separate,
-    O(N)-ish-or-worse memory cost (see CLAUDE.md's dedicated backlog item) that has
-    nothing to do with warp_images_streaming/blend_images_streaming/
-    compute_seam_error_streaming -- this mock isolates exactly the three stages this
-    integration is actually responsible for."""
+def _hand_fed_estimate(n: int, total_span: float = 200.0) -> GlobalPoseEstimate:
+    """A cheap GlobalTransforms matching _synthetic_pipeline_scenario's geometry exactly
+    (translation by i*step), so the test measures only warp/blend/seam_error."""
     step = total_span / n
-    return GlobalTransforms(
-        transforms={i: np.array([[1.0, 0.0, i * step], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]) for i in range(n)},
-        reference_index=0, optimization_status="converged", residual_error=0.0,
+    return _estimate_returning(
+        GlobalTransforms(
+            transforms={i: np.array([[1.0, 0.0, i * step], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]) for i in range(n)},
+            reference_index=None,
+            optimization_status="converged",
+            residual_error=np.nan,
+        )
     )
 
 
 def _peak_traced_bytes_for_pipeline(n: int) -> int:
     images, matcher = _synthetic_pipeline_scenario(n)
-    gt = _hand_fed_global_transforms(n)
+    estimate = _hand_fed_estimate(n)
     tracemalloc.start()
     try:
         tracemalloc.clear_traces()
-        with patch("sea_mosaic.pipeline.compose_global_transforms", return_value=gt):
-            run_pipeline(images, matcher, _base_config())
+        with patch.object(pipeline_module, "estimate_global_poses", return_value=estimate):
+            run_pipeline(images, matcher, PipelineConfig())
         _current, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -574,32 +598,18 @@ def _peak_traced_bytes_for_pipeline(n: int) -> int:
 
 
 def test_run_pipeline_warp_blend_seam_error_peak_memory_is_flat_not_linear_in_n() -> None:
-    """Scope note (renamed from an earlier "end_to_end" name specifically to prevent this
-    misreading): this test verifies ONLY warp_images_streaming/blend_images_streaming/
-    compute_seam_error_streaming's memory behavior through run_pipeline's real
-    orchestration -- it does NOT cover run_pipeline's memory behavior as a whole.
-    compose_global_transforms is mocked out (see _hand_fed_global_transforms) because its
-    real pose-graph solver has a separate, much larger, and entirely independent memory
-    cost that was never in scope for this streaming-accumulator redesign: measured
-    directly, compose_global_transforms alone accounted for 15,948KB of a 16,388KB total
-    peak at n=100 (97%) when left real -- see CLAUDE.md's dedicated backlog item for that
-    finding, which is NOT considered fixed or covered by this test passing.
-
-    With compose_global_transforms isolated out, this is the actual acceptance criterion
-    for the three streaming stages this redesign covers, measured through the real public
-    entry point, not just the lower-level functions in isolation. Deliberately verified
-    (via `git stash` of pipeline.py, not guessed) to fail against the PRE-refactor
-    run_pipeline with this exact same compose mock already in place: peak_10=546548
-    bytes, peak_100=2831789 bytes (ratio ~5.18x, fails the <2.0 bound below) using
-    warp_images/blend_images/eager compute_seam_error's all-pairs O(N^2) call --
-    confirming the compose mock alone does not trivially pass this test, only the actual
-    streaming wiring does."""
+    """Scope note: verifies ONLY warp_images_streaming/blend_images_streaming/
+    compute_seam_error_streaming's memory behaviour through run_pipeline's real
+    orchestration. Pose estimation is mocked out (formerly compose_global_transforms,
+    now estimate_global_poses); its own memory cost is a separate question (see
+    CLAUDE.md). When this test was introduced it was verified (via `git stash` of
+    pipeline.py) to fail against the pre-streaming run_pipeline with the same mock in
+    place: peak_10=546548 bytes, peak_100=2831789 bytes (~5.18x)."""
     peak_10 = _peak_traced_bytes_for_pipeline(10)
     peak_100 = _peak_traced_bytes_for_pipeline(100)
 
     ratio = peak_100 / peak_10
     assert ratio < 2.0, (
         f"peak traced memory scaled {ratio:.2f}x going from N=10 to N=100 "
-        f"(peak_10={peak_10} bytes, peak_100={peak_100} bytes) -- expected roughly flat, "
-        f"not O(N)"
+        f"(peak_10={peak_10} bytes, peak_100={peak_100} bytes) -- expected roughly flat, not O(N)"
     )

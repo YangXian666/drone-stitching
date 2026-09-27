@@ -1358,6 +1358,172 @@ GimbalYawDegree 只在事後當外部真值私下對照（跟「最小可行版�
      GPS 點差分，只用 EXIF 經緯度，符合範圍決定），跟 κ 一樣有界、撞到邊界要回報。
      **還沒評估**：加了 τ 之後 4 個護欄撞擊會不會消失、post-D edge RMS 會不會下降。
 
+### run_pipeline 改接 Stage A→D（2026-09-27）
+
+- **`global_poses.estimate_global_poses`**（commit `bd217e7`）把 Stage A→D 串成一個函式：
+  輸入 pair results、所有影像的 shape、EXIF 經緯度，外加 `heading_anchor_source`
+  （`"gps"`／`"gimbal"`／`"none"`）與 `gimbal_yaw_deg`；輸出北向上像素座標系的
+  `GlobalTransforms`，另附 `GlobalPoseEstimate` 診斷資訊（`failure_reason`、
+  `node_failure_reasons`、ppm、κ、δ、護欄撞擊、`term_rms`、IRLS 輪數）。
+  - 接線完全照「Stage A～D 真實資料驗收」的流程，那次的數字就是這條路徑的品質證據：
+    - 篩邊：inlier ≥ 4 且 homography 是有限值。
+    - ppm 從資料自估。
+    - Stage A 邊權重 `inlier/median`；Stage C 航向邊權重 1.0。
+    - gimbal 錨點直接用 `radians(GimbalYawDegree)`，不翻轉正負號。
+  - **只有至少有一條可用邊的影像會參與任何 stage**：只有 metadata（GPS、gimbal）不算影像
+    證據，不能拿到 pose，也不能改變 Stage B 的原點。
+  - `MIN_INLIERS_FOR_DETERMINED_HOMOGRAPHY = 4` 只在這裡定義一次，從 `pipeline.py` 搬過來，
+    連同「解得出來 ≠ 可信」那段說明。
+  - 測試：G1～G13 加 G8b，共 19 條。**G4 是最重要的防線**：在一個有雜訊、而且含有門檻邊界邊的
+    合成世界上，跟逐步寫出來的 `_manual_chain` 逐位元比對。實作前先用擾動確認這個合成世界
+    本身夠敏感：
+    - 第一版有 3 個盲點（門檻 4→5、4→50、中位數改成對全部邊取），補了 4 inlier、3 inlier
+      和非有限值的邊界邊之後才抓得到。
+    - 中位數那個盲點，起初是因為兩條被排除的邊一條在中位數之上、一條在之下，彼此抵銷。
+    - 實作後做 mutation：16 項全部被抓到。
+- **`run_pipeline` 的新規則**：
+  - **成功判斷**：影像有有限值的 pose，而且 warp 後的遮罩非全黑。原本「是 reference、或有
+    determined edge、或有 GPS anchor」的規則取消。
+  - **單張影像**（task2.md §3.1）：不跑 matcher，也不跑 Stage A～D；直接用單位矩陣，
+    `reference_index` 是那張影像的 index，`converged`，`residual_error` 是 NaN，輸出原影像。
+  - **沒有 GPS**：回報 `failed`，原因用 logging 記錄；matching 仍然會跑，因為
+    `reprojection_error` 等 metrics 在沒有 GPS 時仍有意義。
+  - **沒有收斂**：回傳 `(0, 0, 3)`，不再是 `zeros_like(reference)`，因為已經沒有 reference。
+  - **logging**（`sea_mosaic.pipeline` 的 logger，warning 等級）：記錄 `failure_reason`、
+    `node_failure_reasons`，以及 Stage D 撞到護欄的情況。`metrics_df` 的欄位是 task2.md
+    固定的，`run_pipeline` 的回傳簽名這次不改。
+  - 多張輸入時，成功張數只可能是 0 或 ≥ 2：Stage C 的對齊邊兩端會同時拿到 pose。舊的
+    「只剩 reference 一張」這個狀態已經不存在。
+- **`PipelineConfig`**：
+  - 刪除 `altitude_m`、`dfov_deg`、`reference_index`、`gps_positions`、`gimbal_yaw`、
+    `yaw_anchor_weight`。
+  - 新增 `latlons`（必須是 `load_exif_latlons` 的輸出）、`heading_anchor_source="gps"`、
+    `gimbal_yaw_deg`。
+  - 不再有任何必填欄位；傳入舊欄位會拋 `TypeError`。參數組合的檢查只在
+    `estimate_global_poses` 做一次。
+- **`GlobalTransforms.reference_index`** 改成 `int | None`；新架構填 `None`，`residual_error`
+  填 NaN（依硬性約束 5）。
+- **測試基礎設施**：`tests/synthetic_camera.py` 新增 pipeline 用的合成情境：
+  - 60×80 的小相機，對角線視角跟 DJI 一樣是 82.9°，所以地面覆蓋範圍相同。
+  - `ground_texture` 渲染出的影像、精確的對應點、EXIF 格式的經緯度。
+  - `SceneMatcher` 用物件 identity 辨認影像；列在 `fail_pairs` 的影像對只給 2 個點，讓
+    `cv2.findHomography` 真的拋出例外。
+  - 產生器本身有 9 條一致性測試（`tests/test_synthetic_scene.py`）。
+  - `ground_to_image`／`plane_homography` 新增的 keyword 參數預設是全尺寸相機，已經確認預設
+    呼叫跟原本逐位元相同。
+- **`test_pipeline.py` 的 18 條舊測試逐條處理**：保留、改寫、期望反轉、替換各有依據。
+  - 期望反轉：「有 GPS 但沒有邊」現在算失敗，gps 和 gimbal 兩種模式都測。
+  - 替換：「只剩 reference」換成「沒有可用邊就失敗」；「依高度計算 ppm」換成「沒有 GPS 就
+    失敗並記錄原因」；「沒有 gimbal 時優雅降級」拆成「航向設定原封不動轉交」和「選 gimbal
+    但沒給資料就拋例外」兩條。
+- **`test_run_pipeline_mosaic_is_the_north_up_ground_texture` 特別重要**：這是目前**唯一**
+  驗證座標系慣例本身（而不只是分類邏輯）的端到端測試，直接對應鏡射 bug 那一類錯誤。
+  - 每個 mosaic 像素都要呈現北向上座標系在那裡的地面紋理（`x = ppm·E`、`y = −ppm·N`），
+    畫布原點由真實的影像範圍獨立算出。
+  - 用中位數誤差 < 1.0（實測 0.354）。同一張 mosaic 用錯誤的慣例比對時，中位數是：
+    鏡射 y 29.5、鏡射 x 40.7、旋轉 5° 14.2、位移 1 px 5.9、位移 0.5 px 2.3、比例尺偏 1% 1.8。
+  - **不用平均值的原因**：平均 3.51，被影像邊緣那一圈拉高，見下一條待辦。
+- **待辦：warp/blend 在影像邊緣的暗線（既有性質，不是這次引入的）**。
+  - bilinear warp 會把畫面外的黑色混進每張影像邊緣 1～2 px 的像素，而這些像素在 blend 裡仍然
+    有一點權重。
+  - 合成情境裡，這一圈的平均誤差是 8.07；離邊緣 2 px 以上是 0.31～0.44，等於單張影像的
+    重取樣誤差 0.34。
+  - 在真實影像上，當一張影像的邊緣落在其他影像的覆蓋範圍內，可能會留下一條 1～2 px 的暗線。
+    這次不修。
+- **`distortion` 在新架構下是結構性地恆為 0，不是碰巧算出 0**。Stage D 的 pose 是旋轉加平移、
+  scale 固定為 1，Jacobian 的兩個奇異值恆相等。合成情境實測約 3e-15。**不要把
+  `distortion≈0` 當成幾何沒問題的證據**：這跟之前記錄的 metrics 盲區是同一件事。舊架構的
+  scale 崩潰問題，在新架構下從結構上就不會發生。
+- **golden fixture 刻意重設基準**：
+  - 舊情境都沒有 GPS，在新架構下全部會是 `failed`。`all_images_well_matched` 換成 6 張的
+    合成航線；`isolated_node_without_edge` 是新的情境。舊的
+    `isolated_node_without_gps_anchor` 檔案已經刪除。
+  - `nonfinite_transform_isolated` **沒有重新產生**：它把 pose 估計 mock 掉了，舊 golden
+    仍然逐位元通過。**這只證明 pose 之後的 warp、blend、成功判斷、metrics 這一段在重寫前後
+    輸出一致，不代表新舊架構的 pose 估計一致。**
+  - `capture_golden.py` 改成必須指定情境名稱，沒有「不帶參數就全部重產」的預設行為。
+  - **每次重新產生之後，必須在 5 個全新的行程裡用 sha256 驗證確定性**，這已經寫進它的操作
+    說明。
+
+### blend 的不確定性：OpenCV IPP distanceTransform（2026-09-27）
+
+**這是這個專案裡最有教育意義的除錯案例之一。答案不是一次就找對的：中間有兩次錯誤的診斷，
+其中一次差點以錯誤的修法 commit。兩次都是被同一個檢查抓出來的——「修完之後，在多個全新行程裡
+用 sha256 驗證結果是否真的變成確定性的」。**
+
+- **發現**：重新產生 golden 時連跑兩次，`isolated_node_without_edge.npy` 的 mosaic 竟然不一樣。
+- **逐層排除**（同一行程內重複執行）：
+  - Stage A～D 的 pose、transforms 的 key 順序：逐位元相同。
+  - `cv2.warpPerspective` 的影像和遮罩：相同（多執行緒、單執行緒都測了）。
+  - `cv2.distanceTransform(DIST_L2, DIST_MASK_PRECISE)`：20 次跑出 7～9 種結果。差異極小，
+    但會讓 mosaic 裡剛好卡在 .5 捨入邊界的像素差 1 個灰階（例如 (89, 37) 這個像素，
+    [128, 107, 189] 對 [127, 108, 189]）。
+  - 附帶一個方法上的失誤：第一版診斷用 Python 的 `hash()` 比較不同行程的結果，但它在每個
+    行程裡都會隨機化，那組數字不能用，後來改成 `hashlib.sha256`。
+- **第一次誤判：「OpenCV 會讀取輸出緩衝區原本的內容」**。
+  - 實驗：同一張遮罩，把 dst 預先填成 0、−1、1e9、NaN、亂數，結果在 170～200 個像素上相差
+    1 ULP（9.5e-7）。看起來像是證據。
+  - 據此提出修法：傳入預先填 0 的 dst。也補了一條回歸測試（斷言「dst 預先填 0」），先確認
+    紅燈、再改到綠燈。
+  - **5 個全新行程的 sha256 驗證抓到了錯誤**：修完之後，mosaic 仍然有兩種 sha。回頭檢查才
+    發現，那個實驗沒有控制執行緒數，而且「填 0」永遠是第一個跑的——看到的差異其實是本來就會
+    發生的隨機差異，被我解讀成跟 dst 內容有關。
+  - 修法和測試都已經還原。存成 `.npy` 的「觸發遮罩」在全新行程裡重現不了，所以也沒有放進
+    repo。
+- **第二次誤判：「是 OpenCV 自己的多執行緒」（選項 A）**。
+  - 實驗：同一個遮罩物件，dst 填 0。預設 64 條執行緒時出現 2 種結果；在**任何 OpenCV 操作
+    之前**就設成單執行緒時只有 1 種。6 Mpx 的畫布上，多執行緒和單執行緒有 57.8 萬個像素不同
+    （最大 6.1e-5）。
+  - 依此提出選項 A：只在呼叫時暫時改成單執行緒，代價是慢約 9 倍（116 Mpx 上 0.51 → 4.55
+    秒）。使用者選了 A。
+  - 照 A 實作，也照要求寫了回歸測試：斷言呼叫時 `getNumThreads() == 1`。**這條測試會通過，
+    但 5 個全新行程的驗證顯示仍然不確定**，每個行程都出現 2～3 種 mosaic。
+  - 原因：只要 OpenCV 在行程裡已經用多執行緒跑過，之後的 `setNumThreads(1)` 雖然讓
+    `getNumThreads()` 回報 1，卻管不到造成差異的那條路徑。先前「在任何 OpenCV 操作之前設定」
+    看起來有效，這一點沒有深究，因為已經有更好的解法。
+  - **教訓**：選項 A 的回歸測試斷言的是「設定」，不是「行為」。「測試綠燈但驗證的不是真正
+    重要的性質」這種問題，只有在修完之後直接量測行為（多行程 sha256），才抓得到。
+- **真正的根因：OpenCV 的 IPP 加速路徑**（`cv2.getBuildInformation()`：pthreads 後端，
+  Intel IPP 2026.0.0）。
+  - 用正式的 pipeline 路徑比較三種候選，每種 5 個全新行程 × 每個 8 次：
+    - 選項 A：仍然不確定。
+    - **呼叫時暫時關掉 IPP**：兩個情境都只有 1 種 sha。
+    - scipy 的 `distance_transform_edt`：也只有 1 種 sha，而且**跟關掉 IPP 的 sha 完全相同**。
+  - IPP 開著時，結果跟精確 EDT 最多差 1.9e-6；關掉之後，誤差是 0。
+  - 速度：116 Mpx 上，關掉 IPP 是 0.40 秒，開著是 0.37 秒，幾乎沒有代價；scipy 要 11.75 秒。
+- **定案修法**：`blend._distance_weight`。兩個 blend 函式都呼叫它；呼叫時暫時執行
+  `cv2.ipp.setUseIPP(False)`，在 `finally` 裡還原呼叫端原本的設定（這是整個行程共用的
+  狀態）。回歸測試有三條：
+  1. `test_distance_weight_equals_exact_euclidean_distance_transform`：輸出必須跟 scipy 的
+     精確 EDT **逐位元相同**，而且是在呼叫端開著 IPP 的情況下。這條驗證的是正確性，也能分辨
+     A 和關閉 IPP：在 A 的程式碼上它是紅燈。
+     - 使用的鑑別遮罩（99×114 畫布上一張 60×80、旋轉 70.8° 的影像範圍）是搜尋出來的：
+       IPP 開著時每次都有約 1000 個像素不同；另外 11 種尺寸和角度組合裡，大多數完全沒有差異。
+  2. `test_blend_distance_transform_runs_with_ipp_off_and_restores_it`：呼叫時 IPP 是關閉的，
+     呼叫後會還原（eager 和 streaming 兩個版本都測）。
+  3. `test_opencv_ipp_distance_transform_still_differs_from_exact_edt`：記錄這個 OpenCV 行為
+     仍然存在。如果它開始失敗，代表 OpenCV 已經修好了，應該回頭檢查這個 workaround 還需不需要。
+  - **確定性本身沒辦法寫成可靠的單元測試**，因為它是機率性的，所以放進 `capture_golden.py`
+    的必要步驟。修正後已經驗證：正式程式碼 5 個全新行程 × 8 次，兩個情境各 1 種 sha；
+    golden 在 5 個全新行程裡重新產生，`.npy` 的 sha256 完全相同。
+- **影響範圍**：這個 bug 在這次改動之前就存在（`blend_images` 和 `blend_images_streaming`
+  都有），只是舊的 golden 情境是 3×3、5×5 的極小影像，剛好沒有觸發。
+- **一個未確認的替代解釋**：streaming 重構時，`isolated_node_without_gps_anchor` 有一個像素
+  從 [2,2,2] 變成 [3,3,3]，當時歸因於 eager（float32 alpha）和 streaming（float64 最後才除）
+  的捨入差異。**那一次也可能是 IPP distanceTransform 的不確定性**（一開始懷疑過 dst 內容，
+  後來懷疑過多執行緒，現在知道是 IPP）。舊的程式碼路徑已經不在，無法驗證，維持標成未確認。
+- **待辦：重新評估選項 A'（只在每張影像的外接矩形範圍內計算 distanceTransform，不算整個
+  畫布），同時衡量記憶體和確定性兩個面向**。
+  - 一位學長的 Stage 13 用的是同一個 distanceTransform 函式，做法正是只在每張影像的外接矩形
+    內計算，而他的文件完全沒有提到 IPP 或確定性問題。可能的原因：
+    1. 他的規模剛好落在 IPP 平行化的門檻之下，這個做法意外避開了這個 bug。這是推測，沒有
+       驗證。這次也觀察到：受影響的遮罩只出現在部分尺寸上。
+    2. 他從沒做過「多個全新行程 × sha256」這種等級的確定性驗證，所以就算遇到同樣的問題，
+       也可能沒被發現。這正是這次能抓到問題的關鍵方法，不是巧合。
+  - A' 對 10 月的大規模資料有記憶體上的意義。評估時，要在**關閉 IPP 與不關閉 IPP 兩種情況
+    下**都做多行程 sha256 驗證，同時記錄記憶體效益和確定性。
+  - 要特別注意：影像碰到畫布邊界時，裁切不能改變「畫布邊界不算背景」這個現行的語意。
+
 ### streaming accumulator 記憶體重構回顧（總結）
 
 上面關於 canvas 超線性成長、cgroup 記憶體上限、streaming accumulator 設計與
@@ -1411,6 +1577,11 @@ GimbalYawDegree 只在事後當外部真值私下對照（跟「最小可行版�
    `run_pipeline` 實際會用的路徑，這個 golden 基準已經重新捕捉以反映
    streaming 版本的正確行為（另外兩個沒有踩到這個邊界的 golden 檔案維持
    原樣，byte-for-byte 驗證過未被觸碰）。
+   **（2026-09-27 補註：這個歸因未確認。** 後來發現 OpenCV 的 IPP
+   distanceTransform 路徑本身就不確定，會讓卡在 .5 邊界的像素隨機差 1 個
+   灰階；這一次也可能是它造成的，不是 eager/streaming 的捨入差異。舊的
+   程式碼路徑已經不在，無法驗證。見「blend 的不確定性：OpenCV IPP
+   distanceTransform」。）
 
 5. **新發現的獨立待辦**：驗證這次重構的端到端記憶體測試意外發現
    `compose_global_transforms` 的 `scipy.optimize.least_squares` 求解器
@@ -1591,6 +1762,19 @@ GimbalYawDegree 只在事後當外部真值私下對照（跟「最小可行版�
     - [ ] 沿航跡位置偏移（各航線約 −2.0～−2.6 m，方向跟著航向翻轉，不隨航線累積）：
       評估全域 GPS 時間延遲參數 τ；順便追 4 個 ±5 m 護欄撞擊（0317、0352、0355、0356）
       和 0337→0338 的 GPS 間距異常
+    - [x] `global_poses.estimate_global_poses`：把 Stage A→D 串成一個函式（commit
+      `bd217e7`），19 條測試（G1～G13 加 G8b），16 項 mutation 全部被抓到。見「run_pipeline
+      改接 Stage A→D」
+    - [x] `run_pipeline` 改接 `estimate_global_poses`，`PipelineConfig` 換成新的欄位，
+      合成情境產生器，`test_pipeline.py` 18 條逐條處理並新增北向上真值測試，golden 重設
+      基準，`blend` 的 IPP distanceTransform 不確定性修正。全套件 340/340。見「run_pipeline
+      改接 Stage A→D」與「blend 的不確定性：OpenCV IPP distanceTransform」
+    - [ ] commit 2：刪除舊架構（`posegraph.py`、`compose.py` 以及對應測試等，刪除前先打 tag
+      `pre-staged-switch`）
+    - [ ] 真實資料 smoke run（`data/` 0350～0361），跑之前先問使用者
+    - [ ] warp/blend 影像邊緣 1～2 px 的暗線（bilinear 把畫面外的黑色混進邊緣像素）
+    - [ ] 重新評估選項 A'（distanceTransform 只算外接矩形範圍），同時衡量記憶體和確定性，
+      見「blend 的不確定性」最後一段
     - [ ] 最小可行版本完成後：私下拿 GimbalYawDegree 對照準確度（診斷，不進
       正式邏輯與測試）
     - [ ] 之後：跨航線配對（蛇形資料的 loop closure）、LoRetta 等 matcher 比較實驗
@@ -1810,6 +1994,9 @@ GimbalYawDegree 只在事後當外部真值私下對照（跟「最小可行版�
       行為」，不是遮蓋迴歸，`np.array_equal` 逐位元組相等的比對標準
       維持不變，只換了這一個 golden 檔案內容，另外兩個 golden 檔案
       （byte-for-byte 驗證過未被觸碰）維持原樣。
+      （2026-09-27 補註：這個 eager/streaming 捨入的歸因未確認，另一個
+      候選原因是 OpenCV IPP distanceTransform 的不確定性，見「blend 的
+      不確定性：OpenCV IPP distanceTransform」。）
   - [x] **`compose_global_transforms` 記憶體待辦的後續調查——部分解決，
     不是完全解決，過程中意外發現一個獨立的 pose-graph 退化案例**：
     上一輪發現 `compose_global_transforms` 單獨佔 `run_pipeline` 總

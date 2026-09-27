@@ -439,3 +439,97 @@ def test_blend_images_streaming_peak_memory_is_flat_not_linear_in_n():
         f"(peak_10={peak_10} bytes, peak_100={peak_100} bytes) -- expected ~1x for "
         f"O(canvas_size), not O(N)"
     )
+
+
+# --- distance weights must not take OpenCV's IPP path (determinism + exactness) ----------
+
+
+def _ipp_discriminating_mask() -> np.ndarray:
+    """A warped-image-like mask (60x80 footprint rotated 70.8 deg in a 99x114 canvas) on
+    which OpenCV's IPP distanceTransform differed from the exact Euclidean distance at
+    ~1000 px (up to 1.9e-6) in every call, while the IPP-off path matched it exactly.
+    Found by search; many other sizes and angles show no difference at all."""
+    import cv2
+
+    a = np.radians(70.8)
+    T = np.array([[np.cos(a), -np.sin(a), 57.0], [np.sin(a), np.cos(a), 49.5], [0, 0, 1]]) @ np.array(
+        [[1, 0, -40.0], [0, 1, -30.0], [0, 0, 1]]
+    )
+    return cv2.warpPerspective(np.full((60, 80), 255, np.uint8), T, (114, 99))
+
+
+def _exact_distance_weight(mask: np.ndarray) -> np.ndarray:
+    from scipy.ndimage import distance_transform_edt
+
+    return np.minimum(distance_transform_edt(mask > 0).astype(np.float32), float(np.hypot(*mask.shape)))
+
+
+def test_opencv_ipp_distance_transform_still_differs_from_exact_edt() -> None:
+    """Documents the OpenCV behaviour the IPP workaround in blend._distance_weight exists
+    for. If this starts failing, OpenCV's IPP path now matches the exact EDT on this mask:
+    re-check whether the workaround is still needed (see CLAUDE.md)."""
+    import cv2
+
+    mask = _ipp_discriminating_mask()
+    previous = cv2.ipp.useIPP()
+    cv2.ipp.setUseIPP(True)
+    try:
+        with_ipp = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    finally:
+        cv2.ipp.setUseIPP(previous)
+    exact = _exact_distance_weight(mask)
+    assert np.count_nonzero(np.minimum(with_ipp, float(np.hypot(*mask.shape))) != exact) > 100
+
+
+def test_distance_weight_equals_exact_euclidean_distance_transform() -> None:
+    """The weight must be the exact Euclidean distance (scipy's EDT as independent truth),
+    bit for bit, even with IPP enabled by the caller. OpenCV's IPP path was both
+    non-deterministic run to run (it flipped mosaic pixels on a .5 rounding boundary) and
+    not exact; with IPP off, 40 pipeline runs in 5 fresh processes gave one mosaic, the
+    same as with scipy's EDT (see CLAUDE.md)."""
+    import cv2
+
+    from sea_mosaic.blend import _distance_weight
+
+    mask = _ipp_discriminating_mask()
+    previous = cv2.ipp.useIPP()
+    cv2.ipp.setUseIPP(True)
+    try:
+        weight = _distance_weight(mask)
+    finally:
+        cv2.ipp.setUseIPP(previous)
+    assert weight.dtype == np.float32
+    assert np.array_equal(weight, _exact_distance_weight(mask))
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_blend_distance_transform_runs_with_ipp_off_and_restores_it(monkeypatch, streaming: bool) -> None:
+    """Every distanceTransform call from both blend functions runs with IPP disabled, and
+    the caller's IPP setting is restored afterwards (it is process-global state)."""
+    import cv2
+
+    import sea_mosaic.blend as blend_module
+
+    real = cv2.distanceTransform
+    ipp_during_calls: list[bool] = []
+
+    def recording(*args, **kwargs):
+        ipp_during_calls.append(cv2.ipp.useIPP())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(blend_module.cv2, "distanceTransform", recording)
+    previous = cv2.ipp.useIPP()
+    cv2.ipp.setUseIPP(True)
+    try:
+        warped_images, warped_masks = _single_image_scenario()
+        if streaming:
+            stream = ((k, warped_images.images[k], warped_masks.masks[k]) for k in warped_images.images)
+            blend_images_streaming(stream, warped_images.canvas_size)
+        else:
+            blend_images(warped_images, warped_masks)
+        after = cv2.ipp.useIPP()
+    finally:
+        cv2.ipp.setUseIPP(previous)
+
+    assert ipp_during_calls == [False] * len(warped_images.images)
+    assert after is True
