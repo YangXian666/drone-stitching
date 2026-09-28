@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +145,31 @@ def load_latlon_with_source(path: Path) -> tuple[float, float, str] | None:
         return _xmp_signed_decimal(xmp_lat), _xmp_signed_decimal(xmp_lon), "xmp"
 
     return None
+
+
+def load_capture_time_s(path: Path) -> float | None:
+    """Capture time in seconds from EXIF DateTimeOriginal (tag 0x9003, Exif IFD), plus
+    SubSecTimeOriginal (0x9291) as a decimal fraction when present; None without it.
+
+    Standard EXIF only: xmp:CreateDate is never read (same rule as EXIF-only lat/lon, see
+    CLAUDE.md's 範圍擴大 2026-09-27). The value is a naive timestamp -- no time zone is
+    read -- because only differences and ordering are used.
+    """
+    with Image.open(path) as img:
+        exif_ifd = img.getexif().get_ifd(ExifTags.IFD.Exif)
+    raw = exif_ifd.get(ExifTags.Base.DateTimeOriginal)
+    if not raw:
+        return None
+    try:
+        # UTC is only a fixed reference so the value does not depend on the machine's time
+        # zone; the camera's clock zone is unknown and irrelevant (differences only).
+        seconds = datetime.strptime(str(raw).strip(), "%Y:%m:%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+    subsec = str(exif_ifd.get(ExifTags.Base.SubsecTimeOriginal) or "").strip()
+    if subsec.isdigit():
+        seconds += float(f"0.{subsec}")
+    return seconds
 
 
 def load_gimbal_yaw(path: Path) -> float | None:

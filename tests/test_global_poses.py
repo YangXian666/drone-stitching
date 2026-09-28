@@ -26,6 +26,7 @@ from sea_mosaic.frame_alignment import (
     gps_heading_anchors,
 )
 from sea_mosaic.global_poses import estimate_global_poses
+from sea_mosaic.gps_lag import estimate_gps_lag, shift_latlons, travel_directions
 from sea_mosaic.gps_placement import PairDisplacement, estimate_pixels_per_meter, place_by_gps
 from sea_mosaic.refinement import edge_from_pair_result, refine_poses
 from sea_mosaic.rotation_averaging import (
@@ -502,3 +503,107 @@ def test_g13_output_contract() -> None:
         assert np.array_equal(T[2], [0.0, 0.0, 1.0])
         assert T[:2, :2] @ T[:2, :2].T == pytest.approx(np.eye(2), abs=1e-12)  # rotation, scale 1
         assert np.linalg.det(T[:2, :2]) == pytest.approx(1.0, abs=1e-12)  # not a mirror
+
+
+# ---------------------------------------------------------------------------
+# G14-G17: GPS recording-lag correction at the GPS input, shared by every stage
+# ---------------------------------------------------------------------------
+
+LAG_TRUE_M = 2.3
+INTERVAL_S = 2.5
+
+
+def _capture_times(cameras):
+    """_serpentine_cameras is in flight order."""
+    return {k: 1000.0 + INTERVAL_S * k for k in cameras}
+
+
+def _lagged_latlons(cameras, lag_m):
+    """GPS fixes lag_m ahead of the true centre along the true travel direction (central
+    difference, one-sided at the ends -- written out here, not via gps_lag)."""
+    keys = sorted(cameras)
+    out = {}
+    for n, k in enumerate(keys):
+        a, b = cameras[keys[max(n - 1, 0)]], cameras[keys[min(n + 1, len(keys) - 1)]]
+        u = np.array([b.east_m - a.east_m, b.north_m - a.north_m])
+        u /= np.linalg.norm(u)
+        out[k] = latlon_from_en(cameras[k].east_m + lag_m * u[0], cameras[k].north_m + lag_m * u[1])
+    return out
+
+
+def _centre_errors_px(transforms, cameras, origin_index):
+    origin = cameras[origin_index]
+    return {
+        k: float(np.linalg.norm(_apply(transforms[k], IMAGE_CENTRE[None])[0] - _apply(_true_pose(cameras[k], origin), IMAGE_CENTRE[None])[0]))
+        for k in cameras
+    }
+
+
+def test_g14_lag_correction_removes_the_position_bias_in_every_stage() -> None:
+    """With the lag applied to GPS, the uncorrected run is off by ~lag * ppm (the bias
+    exists); with capture times the estimated lag is removed before Stage A-D and every
+    centre lands on the truth. Tolerance: 0.15 m (the lag tolerance of test_gps_lag plus
+    the U-turn direction mismatch) in pixels."""
+    cameras, pairs, _latlons_exact, shapes = _exact_world()
+    lagged = _lagged_latlons(cameras, LAG_TRUE_M)
+    times = _capture_times(cameras)
+
+    uncorrected = estimate_global_poses(pairs, shapes, lagged)
+    corrected = estimate_global_poses(pairs, shapes, lagged, capture_times_s=times)
+
+    assert corrected.gps_lag.status == "estimated"
+    assert corrected.gps_lag.lag_m == pytest.approx(LAG_TRUE_M, abs=0.1)
+    # Stage B's origin is the smallest evidenced node; its own GPS also moved, so compare
+    # relative placement: truth frame anchored at the origin camera.
+    err_u = _centre_errors_px(uncorrected.global_transforms.transforms, cameras, 0)
+    err_c = _centre_errors_px(corrected.global_transforms.transforms, cameras, 0)
+    assert max(err_u.values()) > 30.0  # ~2 * 2.3 m * 28.7 px/m between opposite lines
+    assert max(err_c.values()) < 0.15 * PPM
+
+
+def test_g15_the_corrected_latlons_feed_every_stage_bit_for_bit() -> None:
+    """Wiring: estimate_global_poses == the validated manual chain run on
+    shift_latlons(latlons, travel_directions(latlons, times), lag), with lag equal to what
+    estimate_gps_lag returns on the usable edges."""
+    cameras, pairs, _, shapes = _noisy_world()
+    lagged = _lagged_latlons(cameras, LAG_TRUE_M)
+    times = _capture_times(cameras)
+
+    result = estimate_global_poses(pairs, shapes, lagged, capture_times_s=times)
+
+    usable = [p for p in pairs if p.inlier_count >= 4 and np.all(np.isfinite(p.homography))]
+    lag = estimate_gps_lag(
+        [HeadingEdge(p.src_index, p.dst_index, p.homography, shapes[p.src_index], 1.0) for p in usable],
+        lagged,
+        times,
+        shapes,
+    )
+    assert result.gps_lag == lag
+    corrected = shift_latlons(lagged, travel_directions(lagged, times), lag.lag_m)
+    ppm, stage_c, stage_d = _manual_chain(pairs, shapes, corrected, "gps")
+    assert result.pixels_per_meter == ppm
+    assert result.global_transforms.transforms.keys() == stage_d.poses.keys()
+    for k, T in stage_d.poses.items():
+        assert np.array_equal(result.global_transforms.transforms[k], T), k
+
+
+def test_g16_without_capture_times_nothing_changes_and_it_is_flagged() -> None:
+    cameras, pairs, latlons, shapes = _noisy_world()
+
+    result = estimate_global_poses(pairs, shapes, latlons)
+
+    assert result.gps_lag.status == "no_capture_times"
+    assert result.gps_lag.lag_m == 0.0
+    assert result.gps_lag.uncorrected_nodes == set(latlons)
+    ppm, _stage_c, stage_d = _manual_chain(pairs, shapes, latlons, "gps")
+    for k, T in stage_d.poses.items():
+        assert np.array_equal(result.global_transforms.transforms[k], T), k
+
+
+def test_g17_lag_diagnostics_are_present_on_failed_runs_too() -> None:
+    cameras, pairs, _, shapes = _exact_world()
+    result = estimate_global_poses(pairs, shapes, None, capture_times_s=_capture_times(cameras))
+    assert result.failure_reason == "no_gps"
+    assert result.gps_lag.status == "not_estimable"
+    assert result.gps_lag.reason == "no_gps"
+    assert result.gps_lag.lag_m == 0.0

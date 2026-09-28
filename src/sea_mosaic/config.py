@@ -26,6 +26,10 @@ class PipelineConfig:
         Used only, and required, with heading_anchor_source="gimbal"; giving it with any
         other source is an error, never silently ignored. Both checks live in
         estimate_global_poses, not here, so there is one place that enforces them.
+    capture_times_s: capture time in seconds per image index -- pass the output of
+        gps_lag.load_exif_capture_times (EXIF DateTimeOriginal only). Used to correct the
+        GPS recording lag at the GPS input for every stage; without it no correction is
+        applied and the run logs that it was not.
     pairs: image pairs to match; None means consecutive-neighbour pairs.
     loops: image-index loops for metrics.compute_cycle_loop_error.
     """
@@ -35,5 +39,6 @@ class PipelineConfig:
     latlons: dict[int, tuple[float, float]] | None = None
     heading_anchor_source: Literal["gps", "gimbal", "none"] = "gps"
     gimbal_yaw_deg: dict[int, float] | None = None
+    capture_times_s: dict[int, float] | None = None
     pairs: list[tuple[int, int]] | None = None
     loops: list[list[int]] | None = None

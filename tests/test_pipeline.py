@@ -29,6 +29,7 @@ import pytest
 import sea_mosaic.pipeline as pipeline_module
 from sea_mosaic.config import PipelineConfig
 from sea_mosaic.global_poses import GlobalPoseEstimate
+from sea_mosaic.gps_lag import GpsLagEstimate
 from sea_mosaic.matcher import MatchResult
 from sea_mosaic.pipeline import run_pipeline
 from sea_mosaic.refinement import BoundHits
@@ -95,6 +96,10 @@ def _estimate_returning(global_transforms: GlobalTransforms, **overrides) -> Glo
         skipped_edges={},
         term_rms={},
         irls_rounds=1,
+        gps_lag=GpsLagEstimate(
+            lag_m=2.3, status="estimated", reason=None, rounds=2, history_m=[0.0, 2.3, 2.3],
+            trusted_nodes=3, uncorrected_nodes=set(),
+        ),
     )
     fields.update(overrides)
     return GlobalPoseEstimate(**fields)
@@ -434,11 +439,71 @@ def test_run_pipeline_forwards_heading_configuration_to_estimate_global_poses() 
         )
 
     default_call, gimbal_call = spy.call_args_list
-    assert default_call.kwargs == {"heading_anchor_source": "gps", "gimbal_yaw_deg": None}
-    assert gimbal_call.kwargs == {"heading_anchor_source": "gimbal", "gimbal_yaw_deg": scene.gimbal_yaw_deg}
+    assert default_call.kwargs == {"heading_anchor_source": "gps", "gimbal_yaw_deg": None, "capture_times_s": None}
+    assert gimbal_call.kwargs == {
+        "heading_anchor_source": "gimbal",
+        "gimbal_yaw_deg": scene.gimbal_yaw_deg,
+        "capture_times_s": None,
+    }
     _pairs, shapes, latlons = default_call.args
     assert shapes == {k: image.shape for k, image in scene.images.items()}
     assert latlons == scene.latlons
+
+
+def test_run_pipeline_forwards_capture_times_to_estimate_global_poses() -> None:
+    """capture_times_s (gps_lag.load_exif_capture_times) reaches estimate_global_poses,
+    which corrects the GPS recording lag at the GPS input for every stage."""
+    scene = _scene(4)
+    times = {k: 1000.0 + 2.5 * k for k in scene.images}
+    real = pipeline_module.estimate_global_poses
+
+    with patch.object(pipeline_module, "estimate_global_poses", wraps=real) as spy:
+        run_pipeline(scene.images, SceneMatcher(scene), _config(scene, capture_times_s=times))
+
+    assert spy.call_args.kwargs["capture_times_s"] == times
+
+
+@pytest.mark.parametrize(
+    "lag, expected",
+    [
+        (
+            GpsLagEstimate(0.0, "not_estimable", "no_trusted_edges", 0, [0.0], 0, {0, 1, 2}),
+            "GPS lag not corrected: not_estimable (no_trusted_edges)",
+        ),
+        (
+            GpsLagEstimate(0.0, "no_capture_times", None, 0, [0.0], 0, {0, 1, 2}),
+            "GPS lag not corrected: no_capture_times",
+        ),
+    ],
+)
+def test_run_pipeline_logs_when_gps_lag_is_not_corrected(caplog, lag, expected) -> None:
+    """The lag diagnostics must reach the run's output even though metrics_df has no
+    column for them (its columns are fixed by docs/task2.md)."""
+    images = {k: _tagged_image(k, size=5) for k in range(3)}
+    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    shift = np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    gt = GlobalTransforms({0: np.eye(3), 1: shift, 2: shift @ shift}, None, "converged", np.nan)
+
+    with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
+        with patch.object(pipeline_module, "estimate_global_poses", return_value=_estimate_returning(gt, gps_lag=lag)):
+            run_pipeline(images, matcher, PipelineConfig())
+
+    assert expected in caplog.text
+
+
+def test_run_pipeline_logs_nodes_left_uncorrected(caplog) -> None:
+    images = {k: _tagged_image(k, size=5) for k in range(3)}
+    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    shift = np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    gt = GlobalTransforms({0: np.eye(3), 1: shift, 2: shift @ shift}, None, "converged", np.nan)
+    lag = GpsLagEstimate(2.3, "estimated", None, 2, [0.0, 2.3, 2.3], 3, {2})
+
+    with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
+        with patch.object(pipeline_module, "estimate_global_poses", return_value=_estimate_returning(gt, gps_lag=lag)):
+            run_pipeline(images, matcher, PipelineConfig())
+
+    assert "GPS lag not applied to images without a travel direction: [2]" in caplog.text
+    assert "GPS lag not corrected" not in caplog.text
 
 
 def test_run_pipeline_gimbal_source_without_gimbal_data_raises() -> None:

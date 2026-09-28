@@ -198,7 +198,40 @@ def gps_heading_anchors(
     Raises ValueError for a non-finite homography or a non-positive edge weight.
     """
     _validate(edges, 1.0)
-    observations: dict[int, list[tuple[float, float, float]]] = {}  # node -> (h, sigma, weight)
+    observations = {
+        node: [(h, sigma, weight) for _edge, h, sigma, weight in obs]
+        for node, obs in gps_heading_observations(latlons, edges, image_shapes, min_gps_distance_m=min_gps_distance_m).items()
+    }
+
+    anchors = {}
+    for node, obs in observations.items():
+        h = np.array([o[0] for o in obs])
+        sigma = np.array([o[1] for o in obs])
+        base = np.array([o[2] for o in obs]) / sigma**2
+        mean = float(np.angle(np.sum(base * np.exp(1j * h))))
+        if robust:
+            for _ in range(20):
+                normalized = np.abs([_wrap(value - mean) for value in h]) / sigma
+                weights = base * np.where(normalized <= HUBER_C, 1.0, HUBER_C / np.maximum(normalized, 1e-12))
+                mean = float(np.angle(np.sum(weights * np.exp(1j * h))))
+        anchors[node] = mean
+    return anchors
+
+
+def gps_heading_observations(
+    latlons: dict[int, tuple[float, float]],
+    edges: list[HeadingEdge],
+    image_shapes: dict[int, tuple[int, ...]],
+    *,
+    min_gps_distance_m: float = MIN_GPS_DISPLACEMENT_M,
+) -> dict[int, list[tuple[tuple[int, int], float, float, float]]]:
+    """Per node, every GPS-derived heading observation (edge key, h, sigma, edge.weight),
+    in edge order, forward then reverse end -- the building block of gps_heading_anchors
+    and of gps_lag's consensus. h = beta - alpha (radians, north-up pixel frame): beta
+    the GPS direction to the other node, alpha the direction to the other image's centre
+    measured in this node's image; sigma from gps_heading_sigma_rad. Edges without GPS
+    at both ends or shorter than min_gps_distance_m give none."""
+    observations: dict[int, list[tuple[tuple[int, int], float, float, float]]] = {}
     for edge in edges:
         i, j = edge.src_index, edge.dst_index
         if i not in latlons or j not in latlons:
@@ -219,19 +252,6 @@ def gps_heading_anchors(
             vector = mapped[:2] / mapped[2] - own_centre
             alpha = np.arctan2(vector[1], vector[0])
             observations.setdefault(node, []).append(
-                (_wrap(bearing - alpha), gps_heading_sigma_rad(alpha, distance_m), edge.weight)
+                ((i, j), _wrap(bearing - alpha), gps_heading_sigma_rad(alpha, distance_m), edge.weight)
             )
-
-    anchors = {}
-    for node, obs in observations.items():
-        h = np.array([o[0] for o in obs])
-        sigma = np.array([o[1] for o in obs])
-        base = np.array([o[2] for o in obs]) / sigma**2
-        mean = float(np.angle(np.sum(base * np.exp(1j * h))))
-        if robust:
-            for _ in range(20):
-                normalized = np.abs([_wrap(value - mean) for value in h]) / sigma
-                weights = base * np.where(normalized <= HUBER_C, 1.0, HUBER_C / np.maximum(normalized, 1e-12))
-                mean = float(np.angle(np.sum(weights * np.exp(1j * h))))
-        anchors[node] = mean
-    return anchors
+    return observations

@@ -8,6 +8,11 @@ weight or parameter may change here without re-validating.
    and a finite homography. Only nodes with at least one used edge ("evidenced" nodes)
    take part in any stage -- metadata alone (GPS, a gimbal reading) is not image evidence
    and must not give a node a pose, nor move the Stage B origin.
+1b. GPS recording lag (gps_lag): estimated on the used edges and removed from lat/lon
+   before anything else reads them, so every stage below sees the same corrected GPS.
+   Without capture times, or when the lag is not estimable, lat/lon pass through
+   unchanged and gps_lag says why. (Travel directions may use the GPS of images without
+   edges -- that orders fixes, it gives no node a pose.)
 2. pixels_per_meter estimated from the data (gps_placement.estimate_pixels_per_meter).
 3. Stage B: place_by_gps, origin = smallest evidenced node with GPS.
 4. Stage A: average_rotations, edge weight inlier_count / median(inlier_count of used edges),
@@ -36,6 +41,7 @@ from sea_mosaic.frame_alignment import (
     align_to_gps_frame,
     gps_heading_anchors,
 )
+from sea_mosaic.gps_lag import GpsLagEstimate, estimate_gps_lag, shift_latlons, travel_directions
 from sea_mosaic.gps_placement import PairDisplacement, estimate_pixels_per_meter, place_by_gps
 from sea_mosaic.refinement import BoundHits, edge_from_pair_result, refine_poses
 from sea_mosaic.rotation_averaging import (
@@ -86,6 +92,7 @@ class GlobalPoseEstimate:
     skipped_edges: dict[tuple[int, int], str]
     term_rms: dict[str, float]
     irls_rounds: int
+    gps_lag: GpsLagEstimate
 
 
 def _validate(heading_anchor_source: str, gimbal_yaw_deg: dict[int, float] | None) -> None:
@@ -106,6 +113,7 @@ def _failed(
     reason: str,
     node_failure_reasons: dict[int, str],
     heading_anchor_source: str,
+    gps_lag: GpsLagEstimate,
     pixels_per_meter: float = float(np.nan),
 ) -> GlobalPoseEstimate:
     return GlobalPoseEstimate(
@@ -122,6 +130,7 @@ def _failed(
         skipped_edges={},
         term_rms={},
         irls_rounds=0,
+        gps_lag=gps_lag,
     )
 
 
@@ -132,13 +141,15 @@ def estimate_global_poses(
     *,
     heading_anchor_source: Literal["gps", "gimbal", "none"] = "gps",
     gimbal_yaw_deg: dict[int, float] | None = None,
+    capture_times_s: dict[int, float] | None = None,
 ) -> GlobalPoseEstimate:
     """Run Stage A->D (see the module docstring for the exact procedure).
 
     image_shapes must list every input image, including ones without any edge. latlons
     must be EXIF-sourced (gps_placement.load_exif_latlons); gimbal_yaw_deg (degrees,
     io_utils.load_gimbal_yaw) is used only, and required, with heading_anchor_source
-    "gimbal". Raises ValueError for an invalid heading_anchor_source / gimbal_yaw_deg
+    "gimbal". capture_times_s (gps_lag.load_exif_capture_times) enables the GPS lag
+    correction. Raises ValueError for an invalid heading_anchor_source / gimbal_yaw_deg
     combination; every data-dependent failure is reported, not raised.
     """
     _validate(heading_anchor_source, gimbal_yaw_deg)
@@ -150,10 +161,16 @@ def estimate_global_poses(
     ]
     evidenced = {p.src_index for p in usable} | {p.dst_index for p in usable}
     reasons = {k: "no_determined_edge" for k in image_shapes if k not in evidenced}
-    located = {k: v for k, v in (latlons or {}).items() if k in evidenced}
+    heading_edges = [
+        HeadingEdge(p.src_index, p.dst_index, p.homography, image_shapes[p.src_index], 1.0) for p in usable
+    ]
 
+    gps_lag = estimate_gps_lag(heading_edges, latlons, capture_times_s, image_shapes)
     if not latlons:
-        return _failed("no_gps", reasons | {k: "unlocated" for k in evidenced}, heading_anchor_source)
+        return _failed("no_gps", reasons | {k: "unlocated" for k in evidenced}, heading_anchor_source, gps_lag)
+    if gps_lag.status == "estimated":
+        latlons = shift_latlons(latlons, travel_directions(latlons, capture_times_s), gps_lag.lag_m)
+    located = {k: v for k, v in latlons.items() if k in evidenced}
 
     try:
         pixels_per_meter = estimate_pixels_per_meter(
@@ -168,6 +185,7 @@ def estimate_global_poses(
             "pixels_per_meter_unavailable",
             reasons | {k: "pixels_per_meter_unavailable" for k in evidenced},
             heading_anchor_source,
+            gps_lag,
         )
 
     placement = place_by_gps(located, pixels_per_meter, node_indices=evidenced)
@@ -181,9 +199,6 @@ def estimate_global_poses(
             p.inlier_count / median_inliers,
         )
         for p in usable
-    ]
-    heading_edges = [
-        HeadingEdge(p.src_index, p.dst_index, p.homography, image_shapes[p.src_index], 1.0) for p in usable
     ]
     if heading_anchor_source == "gps":
         stage_a = average_rotations(
@@ -219,7 +234,7 @@ def estimate_global_poses(
             reasons[k] = "unoriented"
 
     if not stage_d.poses:
-        return _failed("no_posed_nodes", reasons, heading_anchor_source, pixels_per_meter)
+        return _failed("no_posed_nodes", reasons, heading_anchor_source, gps_lag, pixels_per_meter)
 
     return GlobalPoseEstimate(
         global_transforms=GlobalTransforms(
@@ -238,4 +253,5 @@ def estimate_global_poses(
         skipped_edges=dict(stage_d.skipped_edges),
         term_rms=dict(stage_d.term_rms),
         irls_rounds=stage_d.irls_rounds,
+        gps_lag=gps_lag,
     )

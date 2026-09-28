@@ -11,6 +11,7 @@ import pytest
 from sea_mosaic.io_utils import (
     _exif_dms_to_decimal_degrees,
     _xmp_signed_decimal,
+    load_capture_time_s,
     load_gimbal_yaw,
     load_gps_position,
     load_latlon_with_source,
@@ -167,3 +168,54 @@ def test_load_gimbal_yaw_no_xmp_returns_none():
     result = load_gimbal_yaw(FIXTURES / "no_gps.jpg")
 
     assert result is None
+
+
+# --- load_capture_time_s: EXIF DateTimeOriginal (+ SubSecTimeOriginal), never XMP ---------
+
+
+def test_load_capture_time_reads_exif_date_time_original():
+    """Standard EXIF tag 0x9003 (Exif IFD). Only differences and ordering are used, so the
+    absolute epoch is not part of the contract -- the 3 s between the two fixtures is."""
+    t352 = load_capture_time_s(FIXTURES / "DJI_20230127131426_0352_W.JPG")
+    t353 = load_capture_time_s(FIXTURES / "DJI_20230127131429_0353_W.JPG")
+    assert t353 - t352 == 3.0
+
+
+def test_load_capture_time_adds_subsec_time_original(tmp_path):
+    from PIL import ExifTags, Image
+
+    def write(name, subsec):
+        exif = Image.Exif()
+        ifd = exif.get_ifd(ExifTags.IFD.Exif)
+        ifd[ExifTags.Base.DateTimeOriginal] = "2023:01:27 13:14:26"
+        if subsec is not None:
+            ifd[ExifTags.Base.SubsecTimeOriginal] = subsec
+        path = tmp_path / name
+        Image.new("RGB", (8, 8)).save(path, exif=exif)
+        return path
+
+    whole = load_capture_time_s(write("whole.jpg", None))
+    assert load_capture_time_s(write("quarter.jpg", "25")) - whole == pytest.approx(0.25)
+    assert load_capture_time_s(write("fine.jpg", "043")) - whole == pytest.approx(0.043)
+
+
+def test_load_capture_time_ignores_ifd0_date_time(tmp_path):
+    """IFD0 DateTime (0x0132) is when the file was last changed, not when it was taken:
+    without DateTimeOriginal there is no capture time."""
+    from PIL import ExifTags, Image
+
+    exif = Image.Exif()
+    exif[ExifTags.Base.DateTime] = "2023:01:27 13:14:26"
+    path = tmp_path / "ifd0_only.jpg"
+    Image.new("RGB", (8, 8)).save(path, exif=exif)
+    assert load_capture_time_s(path) is None
+
+
+def test_load_capture_time_ignores_xmp_create_date():
+    """exif_stripped_xmp_only.jpg carries xmp:CreateDate but no EXIF time: like lat/lon,
+    capture time is EXIF-only, so this counts as no time."""
+    assert load_capture_time_s(FIXTURES / "exif_stripped_xmp_only.jpg") is None
+
+
+def test_load_capture_time_no_exif_returns_none():
+    assert load_capture_time_s(FIXTURES / "no_gps.jpg") is None

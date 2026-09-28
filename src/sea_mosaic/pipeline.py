@@ -56,6 +56,17 @@ def _log_pose_estimate(estimate: GlobalPoseEstimate) -> None:
         logger.warning(
             "images without a global pose: %s", dict(sorted(estimate.node_failure_reasons.items()))
         )
+    lag = estimate.gps_lag
+    if lag.status != "estimated":
+        logger.warning(
+            "GPS lag not corrected: %s", lag.status + (f" ({lag.reason})" if lag.reason else "")
+        )
+    elif lag.uncorrected_nodes:
+        logger.warning(
+            "GPS lag not applied to images without a travel direction: %s", sorted(lag.uncorrected_nodes)
+        )
+    else:
+        logger.info("GPS lag corrected: %.2f m after %d rounds", lag.lag_m, lag.rounds)
     hits = estimate.bound_hits
     if hits is not None and (hits.position or hits.kappa):
         # Guard rails only catch gross failure; every hit is a diagnostic signal.
@@ -147,6 +158,7 @@ def run_pipeline(
             config.latlons,
             heading_anchor_source=config.heading_anchor_source,
             gimbal_yaw_deg=config.gimbal_yaw_deg,
+            capture_times_s=config.capture_times_s,
         )
         _log_pose_estimate(estimate)
         global_transforms = estimate.global_transforms

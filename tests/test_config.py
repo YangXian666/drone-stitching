@@ -25,6 +25,7 @@ def test_config_fields_are_exactly_the_new_set() -> None:
         "latlons",
         "heading_anchor_source",
         "gimbal_yaw_deg",
+        "capture_times_s",
         "pairs",
         "loops",
     ]
