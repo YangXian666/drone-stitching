@@ -25,17 +25,17 @@ from sea_mosaic.geo.projection import geodetic_to_local_xy
 from sea_mosaic.gps_placement import MIN_GPS_DISPLACEMENT_M, GpsPlacement
 from sea_mosaic.rotation_averaging import RotationAveragingResult
 
-# GPS-derived heading anchors (gps_heading_anchors). All values data-derived on data/ and to
-# be re-validated on the October dataset -- see CLAUDE.md's Stage D 設計定案 and
-# Stage D 改為只精修位置 for the derivations and limitations.
-MAD_TO_SIGMA = 1.4826  # standard deviation per median absolute deviation (normal)
-HEADING_SIGMA0_DEG = 0.5  # along-track (beta - alpha) spread, median absolute deviation
-HEADING_K_DEG2 = 57.0  # growth of that spread as travel turns across the image
-# Cross-track GPS error implied by the 0.74 deg along-track sigma at the typical 13.5 m
-# spacing (0.174 m): makes short baselines less trusted. Without it an 8.4 m edge at a
-# U-turn, aligned with the image's vertical axis, got the highest weight of all and pulled
-# its node 11 deg off (the 0351 case).
-CROSS_TRACK_SIGMA_M = float(np.radians(MAD_TO_SIGMA * HEADING_SIGMA0_DEG) * 13.5)
+# Heading-observation noise: ONE constant for every observation (gps_heading_observations),
+# refit on lag-corrected GPS -- leave-one-out MAD sigma over 468 observations of 244
+# land-verified edges, converged 1.522 -> 1.718 -> 1.687 -> 1.692 -> 1.691 deg; leave-one-
+# line-out fits 1.66-1.89 deg. The old model (sigma0 0.5 deg, k*cos^2(alpha) with k = 57,
+# 0.174 m / d) was fitted on GPS still carrying the recording lag: on the same edges its
+# alpha dependence (1.20 -> 7.66 deg) vanishes once the lag is removed (0.99-1.88 deg), as
+# does the same- vs opposite-direction difference. Heavy tails (turns, few inliers) are left
+# to the consensus gate gps_lag.CONSENSUS_Z, not modelled here. See CLAUDE.md's 航向觀測 σ
+# 模型重新擬合; re-validate on the October dataset.
+HEADING_SIGMA_DEG = 1.691
+_HEADING_SIGMA_RAD = float(np.radians(HEADING_SIGMA_DEG))
 HUBER_C = 1.345  # Huber constant for 95% efficiency under normal noise
 # Neutral default weight for these anchors in average_rotations: one anchor counts as much
 # as one typical edge (edge weights are inlier/median, median 1), neither boosted nor
@@ -161,18 +161,6 @@ def align_to_gps_frame(
     )
 
 
-def gps_heading_sigma_rad(alpha_rad: float, distance_m: float) -> float:
-    """Standard deviation (radians) of one GPS-derived heading observation h = beta - alpha.
-
-    sigma^2 = sigma_alpha^2 + (CROSS_TRACK_SIGMA_M / d)^2, with
-    sigma_alpha = radians(1.4826 * sqrt(sigma0^2 + k cos^2 alpha)). alpha is the travel
-    direction measured in the observing image, atan2(v_y, v_x) in pixels with y pointing
-    down, so the image's vertical axis (along-track) is alpha = +-90 deg.
-    """
-    sigma_alpha = np.radians(MAD_TO_SIGMA * np.sqrt(HEADING_SIGMA0_DEG**2 + HEADING_K_DEG2 * np.cos(alpha_rad) ** 2))
-    return float(np.hypot(sigma_alpha, CROSS_TRACK_SIGMA_M / distance_m))
-
-
 def gps_heading_anchors(
     latlons: dict[int, tuple[float, float]],
     edges: list[HeadingEdge],
@@ -190,7 +178,7 @@ def gps_heading_anchors(
     direction of i -> j in the north-up pixel frame (x = East, y = -North; needs no
     pixels_per_meter) and alpha the direction to j's centre measured in i's image. Neither
     depends on Stage A. Per node, observations are combined as a circular mean weighted by
-    edge.weight / gps_heading_sigma_rad^2, then (robust=True) Huber-reweighted on
+    edge.weight / sigma^2 (one constant sigma, HEADING_SIGMA_DEG), then (robust=True) Huber-reweighted on
     sigma-normalized residuals to resist gross errors such as GPS/exposure timing offsets
     during turns. Nodes with no usable observation are absent from the result. robust
     exists so a capability test can compare against the plain weighted mean.
@@ -229,7 +217,7 @@ def gps_heading_observations(
     in edge order, forward then reverse end -- the building block of gps_heading_anchors
     and of gps_lag's consensus. h = beta - alpha (radians, north-up pixel frame): beta
     the GPS direction to the other node, alpha the direction to the other image's centre
-    measured in this node's image; sigma from gps_heading_sigma_rad. Edges without GPS
+    measured in this node's image; sigma = HEADING_SIGMA_DEG for every observation. Edges without GPS
     at both ends or shorter than min_gps_distance_m give none."""
     observations: dict[int, list[tuple[tuple[int, int], float, float, float]]] = {}
     for edge in edges:
@@ -252,6 +240,6 @@ def gps_heading_observations(
             vector = mapped[:2] / mapped[2] - own_centre
             alpha = np.arctan2(vector[1], vector[0])
             observations.setdefault(node, []).append(
-                ((i, j), _wrap(bearing - alpha), gps_heading_sigma_rad(alpha, distance_m), edge.weight)
+                ((i, j), _wrap(bearing - alpha), _HEADING_SIGMA_RAD, edge.weight)
             )
     return observations

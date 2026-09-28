@@ -46,12 +46,23 @@ from sea_mosaic.io_utils import load_capture_time_s
 # 5 m threshold: the data does not pin the value down; re-validate on the October dataset.
 CAPTURE_GAP_FACTOR = 3.0
 
-# Per-node heading consensus. PROVISIONAL: these are the values the lag estimate was
-# validated with; the final values are decided with the edge-consistency check, after
-# Stage A-D is re-validated on lag-corrected GPS (CLAUDE.md).
-CONSENSUS_Z = 3.0  # an observation agrees if |h - consensus| <= Z * its own sigma
-CONSENSUS_MIN_AGREE = 3  # a node needs at least this many agreeing observations ...
-CONSENSUS_MIN_SHARE = 0.6  # ... making up at least this share of its observations
+# Per-node heading consensus (also used by edge_consistency). CLAUDE.md's 邊一致性檢查：
+# 參數定案 and 航向觀測 σ 模型重新擬合.
+# An observation agrees if |h - consensus| <= Z * its own sigma. Z = 6.31 (~10.7 deg with the
+# constant 1.691 deg sigma): p99 of |z| on leave-one-line-out held-out data; node-cluster
+# bootstrap 95% CI [4.41, 7.49]. It carries the heavy tails (turns, low inlier counts).
+CONSENSUS_Z = 6.31
+# PROVISIONAL -- NOT validated: carried over from the very first assumption ("three points
+# before there is a consensus"). Unlike every other value here it was never derived from or
+# checked against data. It also decides which topologies can be verified at all: a node with
+# fewer candidate edges can never be trusted, so all its edges are rejected. Re-evaluate first
+# if the October candidate pairing leaves nodes with few edges.
+CONSENSUS_MIN_AGREE = 3
+# ... making up at least this share of its observations. 50% lies between the open-water
+# maximum (40%) and the land-verified minimum (77%) -- the 0.05-5% stratum in between is a
+# continuum, there is no gap to read a value from -- and, unlike 60%, rejects no
+# land-verified node anywhere in Z's 95% CI.
+CONSENSUS_MIN_SHARE = 0.5
 
 # Lag search: grid over [min, max] in steps; stop when L moves by <= one step.
 LAG_SEARCH_MIN_M = -10.0

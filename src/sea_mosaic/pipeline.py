@@ -10,7 +10,7 @@ import pandas as pd
 
 from sea_mosaic.blend import blend_images_streaming
 from sea_mosaic.config import PipelineConfig
-from sea_mosaic.estimate import match_pair, sequential_pairs
+from sea_mosaic.estimate import gps_proximity_pairs, match_pair, sequential_pairs
 from sea_mosaic.geo.camera import CameraIntrinsics, CameraPose
 from sea_mosaic.global_poses import GlobalPoseEstimate, estimate_global_poses
 from sea_mosaic.matcher import Matcher
@@ -67,6 +67,12 @@ def _log_pose_estimate(estimate: GlobalPoseEstimate) -> None:
         )
     else:
         logger.info("GPS lag corrected: %.2f m after %d rounds", lag.lag_m, lag.rounds)
+    rejected = estimate.edge_check.rejected
+    if rejected:
+        counts: dict[str, int] = {}
+        for reason in rejected.values():
+            counts[reason] = counts.get(reason, 0) + 1
+        logger.warning("edge consistency check rejected %d edges: %s", len(rejected), dict(sorted(counts.items())))
     hits = estimate.bound_hits
     if hits is not None and (hits.position or hits.kappa):
         # Guard rails only catch gross failure; every hit is a diagnostic signal.
@@ -132,7 +138,16 @@ def run_pipeline(
     if input_image_count == 1:
         global_transforms = _single_image_transforms(all_indices[0])
     else:
-        pairs = config.pairs if config.pairs is not None else sequential_pairs(images)
+        # Default pairing: with GPS, every pair closer than 40 m -- sequential pairs give each
+        # node <= 2 edges, which the edge-consistency check can never verify (it needs
+        # CONSENSUS_MIN_AGREE observations per node). Without GPS the run fails anyway
+        # (no_gps); matching stays sequential so the matching metrics still mean something.
+        if config.pairs is not None:
+            pairs = config.pairs
+        elif config.latlons:
+            pairs = gps_proximity_pairs({k: v for k, v in config.latlons.items() if k in images})
+        else:
+            pairs = sequential_pairs(images)
 
         # --- estimate: run_pipeline is the system boundary, so a single bad pair (e.g.
         # too few raw matches -> cv2.error from cv2.findHomography) is caught and skipped

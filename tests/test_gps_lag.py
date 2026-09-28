@@ -217,10 +217,10 @@ def _obs(headings_deg, sigma_deg=1.0):
     return [HeadingObservation((0, k + 1), math.radians(h), math.radians(sigma_deg)) for k, h in enumerate(headings_deg)]
 
 
-def test_l4_consensus_parameters_are_the_validated_provisional_values() -> None:
-    """Validated with these values (CLAUDE.md); final values are decided together with the
-    edge-consistency check, after Stage A-D is re-validated on lag-corrected GPS."""
-    assert (CONSENSUS_Z, CONSENSUS_MIN_AGREE, CONSENSUS_MIN_SHARE) == (3.0, 3, 0.6)
+def test_s5_consensus_parameters_are_the_finalized_values() -> None:
+    """Z = 6.31 (held-out p99 under the constant sigma) and share 50% are final (CLAUDE.md's
+    邊一致性檢查：參數定案); MIN_AGREE = 3 is the one unvalidated, PROVISIONAL value."""
+    assert (CONSENSUS_Z, CONSENSUS_MIN_AGREE, CONSENSUS_MIN_SHARE) == (6.31, 3, 0.5)
 
 
 def test_l4_agreeing_observations_are_trusted_with_weighted_circular_mean() -> None:
@@ -248,25 +248,25 @@ def test_l4_no_consensus_marks_the_whole_node_failed() -> None:
     assert result.n_obs == 8
 
 
-def test_l4_share_and_count_boundaries() -> None:
-    three_of_five = heading_consensus(_obs([0, 0.5, -0.5, 90, -90]))
+def test_s6_share_and_count_boundaries() -> None:
+    """Share >= 50% trusts (exactly half included); fewer than 3 agreeing never trusts."""
     three_of_six = heading_consensus(_obs([0, 0.5, -0.5, 90, -90, 180]))
+    three_of_seven = heading_consensus(_obs([0, 0.5, -0.5, 90, -90, 180, 45]))
     two_of_two = heading_consensus(_obs([0, 0.5]))
-    assert three_of_five.trusted and (three_of_five.n_agree, three_of_five.n_obs) == (3, 5)
-    assert not three_of_six.trusted and (three_of_six.n_agree, three_of_six.n_obs) == (3, 6)
+    assert three_of_six.trusted and (three_of_six.n_agree, three_of_six.n_obs) == (3, 6)
+    assert not three_of_seven.trusted and (three_of_seven.n_agree, three_of_seven.n_obs) == (3, 7)
     assert not two_of_two.trusted  # fewer than CONSENSUS_MIN_AGREE observations
-    assert [three_of_five.agrees[(0, k)] for k in range(1, 6)] == [True, True, True, False, False]
+    assert [three_of_six.agrees[(0, k)] for k in range(1, 7)] == [True, True, True, False, False, False]
 
 
-def test_l4_agreement_uses_each_observations_own_sigma() -> None:
-    tight = heading_consensus(
-        _obs([0, 0, 0]) + [HeadingObservation((0, 9), math.radians(4.0), math.radians(1.0))]
-    )
-    loose = heading_consensus(
-        _obs([0, 0, 0]) + [HeadingObservation((0, 9), math.radians(4.0), math.radians(2.0))]
-    )
-    assert not tight.agrees[(0, 9)]  # 4 sigma > 3
-    assert loose.agrees[(0, 9)]  # 2 sigma <= 3
+def test_s6_agreement_gate_is_z_times_each_observations_own_sigma() -> None:
+    """Z = 6.31: 6 sigma agrees, 7 sigma does not (the old Z = 3 rejected both)."""
+    inside = heading_consensus(_obs([0, 0, 0]) + [HeadingObservation((0, 9), math.radians(6.0), math.radians(1.0))])
+    outside = heading_consensus(_obs([0, 0, 0]) + [HeadingObservation((0, 9), math.radians(7.0), math.radians(1.0))])
+    looser = heading_consensus(_obs([0, 0, 0]) + [HeadingObservation((0, 9), math.radians(7.0), math.radians(2.0))])
+    assert inside.agrees[(0, 9)]
+    assert not outside.agrees[(0, 9)]
+    assert looser.agrees[(0, 9)]  # 3.5 sigma
 
 
 def test_l4_wraparound() -> None:
@@ -401,14 +401,21 @@ def test_l5_a_single_straight_line_cannot_identify_the_lag() -> None:
     assert est.lag_m == 0.0
 
 
-def test_l5_optimum_on_the_search_bound_is_not_trusted() -> None:
-    """A lag beyond the search range puts the optimum on the grid edge: reported, not used."""
-    edges, latlons, times, shapes = _world(12.0)
+def test_l5_optimum_on_the_search_bound_is_not_trusted(monkeypatch) -> None:
+    """A lag beyond the search range puts the optimum on the grid edge: reported, not used.
+    The range is narrowed to 2.0 m (true lag 2.3 m) so the optimum provably lands on the
+    bound whatever the consensus gate. (With the constant 1.691 deg sigma a truly huge lag,
+    e.g. 12 m, already fails earlier as not_identifiable: at L0 = 0 its cross-line
+    observations are all outside the ~10.7 deg gate, leaving < 10 opposite-direction edges.)"""
+    import sea_mosaic.gps_lag as gps_lag
+
+    monkeypatch.setattr(gps_lag, "LAG_SEARCH_MAX_M", 2.0)
+    edges, latlons, times, shapes = _world(2.3)
     est = estimate_gps_lag(edges, latlons, times, shapes)
     assert est.status == "not_estimable"
     assert est.reason == "search_bound"
     assert est.lag_m == 0.0
-    assert est.history_m[-1] == pytest.approx(10.0)
+    assert est.history_m[-1] == pytest.approx(2.0)
 
 
 def test_l5_running_out_of_rounds_is_not_converged(monkeypatch) -> None:

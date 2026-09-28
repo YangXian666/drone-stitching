@@ -25,6 +25,7 @@ from sea_mosaic.frame_alignment import (
     align_to_gps_frame,
     gps_heading_anchors,
 )
+from sea_mosaic.edge_consistency import check_edge_consistency
 from sea_mosaic.global_poses import estimate_global_poses
 from sea_mosaic.gps_lag import estimate_gps_lag, shift_latlons, travel_directions
 from sea_mosaic.gps_placement import PairDisplacement, estimate_pixels_per_meter, place_by_gps
@@ -224,6 +225,7 @@ def _manual_chain(pairs, shapes, latlons, source, gimbal_yaw_deg=None):
     """The validated real-data procedure (CLAUDE.md's Stage A～D 真實資料驗收, accuracy_diag),
     spelled out step by step. estimate_global_poses must reproduce this bit for bit."""
     usable = [p for p in pairs if p.inlier_count >= 4 and np.all(np.isfinite(p.homography))]
+    usable = check_edge_consistency(usable, latlons, shapes).accepted  # the second line of defence
     ppm = estimate_pixels_per_meter(
         [
             PairDisplacement(p.homography, shapes[p.src_index], latlons[p.src_index], latlons[p.dst_index])
@@ -354,16 +356,20 @@ def test_g5_no_gps_is_reported_without_raising(latlons) -> None:
     assert set(result.node_failure_reasons) == set(cameras)
 
 
-def test_g6_all_gps_displacements_below_threshold_reports_ppm_unavailable() -> None:
+def test_g6_all_gps_displacements_below_threshold_fail_in_the_edge_check() -> None:
+    """Every edge is shorter than 5 m: the edge-consistency check rejects them all as
+    too_short (no heading observation to verify them with), before Stage B could report
+    pixels_per_meter_unavailable -- which accepted edges (all >= 5 m) can no longer cause."""
     cameras = {k: SyntheticCamera(2.0 * k, 0.0, ALTITUDE, 70.8) for k in range(3)}  # 2 m steps
     cameras, pairs, latlons, shapes = _exact_world(cameras)
 
     result = estimate_global_poses(pairs, shapes, latlons)
 
-    assert result.failure_reason == "pixels_per_meter_unavailable"
+    assert result.failure_reason == "no_consistent_edges"
+    assert set(result.edge_check.rejected.values()) == {"too_short"}
     assert result.global_transforms.transforms == {}
     assert result.global_transforms.optimization_status == "failed"
-    assert set(result.node_failure_reasons) == set(cameras)
+    assert result.node_failure_reasons == {k: "no_consistent_edge" for k in cameras}
 
 
 def test_g7_node_without_gps_is_unlocated_and_others_are_unaffected() -> None:
@@ -442,9 +448,11 @@ def test_g9_edges_with_under_four_inliers_or_nonfinite_homography_are_ignored() 
         assert np.array_equal(result.global_transforms.transforms[k], pose), k
 
 
-def test_g10_component_without_usable_alignment_edge_is_unaligned() -> None:
-    """A second component far away whose only edge is shorter than 5 m: Stage C has no
-    usable edge to align it, so its nodes get no pose; the main component is unaffected."""
+def test_g10_component_whose_only_edge_is_too_short_gets_no_pose() -> None:
+    """A second component far away whose only edge is shorter than 5 m. Before the
+    edge-consistency check Stage C found no usable edge to align it (unaligned_component);
+    now the check rejects that edge as too_short first, so its nodes have no consistent
+    edge. Either way they get no pose and the main component is unaffected."""
     cameras, pairs, latlons, shapes = _exact_world()
     far = {50: SyntheticCamera(400.0, 400.0, ALTITUDE, 10.0), 51: SyntheticCamera(402.0, 400.5, ALTITUDE, 10.0)}
     pairs = pairs + [_pair(far, 50, 51)]
@@ -454,7 +462,8 @@ def test_g10_component_without_usable_alignment_edge_is_unaligned() -> None:
     result = estimate_global_poses(pairs, shapes, latlons)
 
     assert result.failure_reason is None
-    assert result.node_failure_reasons == {50: "unaligned_component", 51: "unaligned_component"}
+    assert result.node_failure_reasons == {50: "no_consistent_edge", 51: "no_consistent_edge"}
+    assert result.edge_check.rejected == {(50, 51): "too_short"}
     _assert_matches_truth(result.global_transforms.transforms, cameras, 0)
 
 
@@ -607,3 +616,62 @@ def test_g17_lag_diagnostics_are_present_on_failed_runs_too() -> None:
     assert result.gps_lag.status == "not_estimable"
     assert result.gps_lag.reason == "no_gps"
     assert result.gps_lag.lag_m == 0.0
+
+
+# ---------------------------------------------------------------------------
+# G18-G20: the edge-consistency check sits between the edge filter and Stage A
+# ---------------------------------------------------------------------------
+
+
+def _random_homography(rng) -> np.ndarray:
+    t = rng.uniform(-np.pi, np.pi)
+    return np.array([[np.cos(t), -np.sin(t), rng.uniform(-3000, 3000)],
+                     [np.sin(t), np.cos(t), rng.uniform(-3000, 3000)], [0.0, 0.0, 1.0]])
+
+
+def _with_false(pairs, keys, rng):
+    return [PairResult(p.src_index, p.dst_index, p.src_points, p.dst_points, p.inlier_mask, _random_homography(rng))
+            if (p.src_index, p.dst_index) in keys else p for p in pairs]
+
+
+def test_g18_only_consistent_edges_reach_stage_a_to_d_bit_for_bit() -> None:
+    """False edges injected into the noisy world: estimate_global_poses equals the manual
+    chain, which runs Stage A-D on the check's accepted edges only; every false edge is
+    rejected and reported."""
+    cameras, pairs, latlons, shapes = _noisy_world()
+    rng = np.random.default_rng(17)
+    false = {(p.src_index, p.dst_index) for p in pairs[1:12:3]}
+    pairs = _with_false(pairs, false, rng)
+
+    result = estimate_global_poses(pairs, shapes, latlons)
+
+    assert false <= set(result.edge_check.rejected)
+    ppm, _stage_c, stage_d = _manual_chain(pairs, shapes, latlons, "gps")
+    assert result.pixels_per_meter == ppm
+    assert result.global_transforms.transforms.keys() == stage_d.poses.keys()
+    for k, T in stage_d.poses.items():
+        assert np.array_equal(result.global_transforms.transforms[k], T), k
+
+
+def test_g19_node_whose_every_edge_is_rejected_has_no_consistent_edge() -> None:
+    cameras, pairs, latlons, shapes = _exact_world()
+    rng = np.random.default_rng(19)
+    pairs = _with_false(pairs, {(p.src_index, p.dst_index) for p in pairs if 3 in (p.src_index, p.dst_index)}, rng)
+
+    result = estimate_global_poses(pairs, shapes, latlons)
+
+    assert result.node_failure_reasons[3] == "no_consistent_edge"
+    assert 3 not in result.global_transforms.transforms
+    assert set(result.global_transforms.transforms) == set(cameras) - {3}
+
+
+def test_g20_no_consistent_edge_at_all_fails_the_run() -> None:
+    cameras, pairs, latlons, shapes = _exact_world()
+    rng = np.random.default_rng(20)
+    pairs = _with_false(pairs, {(p.src_index, p.dst_index) for p in pairs}, rng)
+
+    result = estimate_global_poses(pairs, shapes, latlons)
+
+    assert result.failure_reason == "no_consistent_edges"
+    assert result.global_transforms.transforms == {}
+    assert result.node_failure_reasons == {k: "no_consistent_edge" for k in cameras}

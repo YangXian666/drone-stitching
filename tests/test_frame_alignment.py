@@ -323,8 +323,10 @@ def test_stage_a_b_c_results_are_identical_with_xmp_stripped(tmp_path: Path) -> 
 # Per CLAUDE.md's Stage D 改為只精修位置: for the path without GimbalYawDegree, each
 # edge's h = beta - alpha (GPS displacement direction minus the travel direction measured
 # in the image) is an absolute heading observation of a node; each edge gives one per
-# direction. Per node they are combined with weight 1/sigma^2, sigma^2 = sigma_alpha(alpha)^2
-# + (0.174 m / d)^2, and Huber reweighting (c = 1.345). No metadata beyond EXIF lat/lon.
+# direction. Per node they are combined with weight edge.weight / sigma^2 -- sigma is ONE
+# constant (HEADING_SIGMA_DEG = 1.691, refit on lag-corrected GPS; CLAUDE.md's 航向觀測 σ 模型
+# 重新擬合), so only edge.weight differs -- and Huber reweighting (c = 1.345). No metadata
+# beyond EXIF lat/lon.
 
 import sea_mosaic.frame_alignment as fa  # noqa: E402  (attributes looked up per test)
 
@@ -342,15 +344,54 @@ def test_gps_heading_anchor_weight_is_the_neutral_default() -> None:
     assert fa.GPS_HEADING_ANCHOR_WEIGHT == 1.0  # CLAUDE.md: neutral default, not chosen via gimbal
 
 
-def test_gps_heading_sigma_values() -> None:
-    cross_track_m = np.radians(1.4826 * 0.5) * 13.5  # 0.174 m, from the 13.5 m along-track sigma
-    along = np.radians(1.4826 * 0.5)
-    across = np.radians(1.4826 * np.sqrt(0.5**2 + 57.0))
-    for alpha_deg in (90.0, -90.0):
-        for d in (6.0, 13.5, 40.0):
-            assert fa.gps_heading_sigma_rad(np.radians(alpha_deg), d) == pytest.approx(np.hypot(along, cross_track_m / d), rel=1e-12)
-    assert fa.gps_heading_sigma_rad(0.0, 13.5) == pytest.approx(np.hypot(across, cross_track_m / 13.5), rel=1e-12)
-    assert fa.gps_heading_sigma_rad(np.radians(90.0), 6.0) > fa.gps_heading_sigma_rad(np.radians(90.0), 40.0)
+def test_s1_heading_sigma_is_the_refit_constant_and_the_old_model_is_gone() -> None:
+    """1.691 deg: LOO MAD sigma on lag-corrected GPS, converged (CLAUDE.md). The alpha- and
+    distance-dependent model absorbed the GPS recording lag and must not come back."""
+    assert fa.HEADING_SIGMA_DEG == 1.691
+    for old in ("gps_heading_sigma_rad", "HEADING_SIGMA0_DEG", "HEADING_K_DEG2", "CROSS_TRACK_SIGMA_M"):
+        assert not hasattr(fa, old), old
+
+
+def test_s2_every_observation_gets_the_same_sigma_whatever_its_direction_or_length() -> None:
+    """Along-track (alpha = +-90 deg) and cross-track (alpha ~ 0) edges, 6 m and 40 m apart:
+    the old model gave them sigmas from 0.74 deg to ~11 deg."""
+    yaw = 83.0
+    cam = lambda e, n: SyntheticCamera(e, n, 100.0, yaw)
+    along = lambda d: (d * np.sin(np.radians(yaw)), d * np.cos(np.radians(yaw)))
+    across = lambda d: (d * np.cos(np.radians(yaw)), -d * np.sin(np.radians(yaw)))
+    cameras = {0: cam(0.0, 0.0), 1: cam(*along(6.0)), 2: cam(*along(40.0)), 3: cam(*across(6.0)), 4: cam(*across(30.0))}
+    latlons, edges, shapes = _anchor_world(cameras, [(0, 1), (0, 2), (0, 3), (0, 4)])
+
+    obs = fa.gps_heading_observations(latlons, edges, shapes)
+
+    sigmas = {round(sigma, 15) for node_obs in obs.values() for _key, _h, sigma, _w in node_obs}
+    assert sigmas == {round(float(np.radians(1.691)), 15)}
+    assert sum(len(o) for o in obs.values()) == 8  # every edge, both ends
+
+
+def test_s3_plain_anchor_is_the_edge_weighted_circular_mean_in_closed_form() -> None:
+    """With one constant sigma, the non-robust anchor is the circular mean of the node's
+    observations weighted by edge.weight ONLY. Mixed directions and GPS noise make the
+    observations differ, so a direction- or distance-dependent sigma (the old model) would
+    move the result -- this pins the values, not just the wiring."""
+    yaw = 70.8
+    course = 83.0
+    pos = lambda d: (d * np.sin(np.radians(course)), d * np.cos(np.radians(course)))
+    cameras = {0: SyntheticCamera(0.0, 0.0, 100.0, yaw), 1: SyntheticCamera(*pos(13.4), 100.0, yaw),
+               2: SyntheticCamera(*pos(26.8), 100.0, yaw), 3: SyntheticCamera(-3.3, 27.0, 100.0, -109.2),
+               4: SyntheticCamera(10.0, 29.0, 100.0, -109.2)}
+    offsets = {1: (0.4, -0.3), 2: (-0.5, 0.2), 3: (0.3, 0.6), 4: (-0.6, -0.4)}
+    latlons, edges, shapes = _anchor_world(cameras, [(0, 1), (0, 2), (0, 3), (0, 4)], latlon_offsets_m=offsets)
+    weights = [1.0, 2.0, 0.5, 3.0]
+    edges = [HeadingEdge(e.src_index, e.dst_index, e.homography, e.src_image_shape, w) for e, w in zip(edges, weights)]
+
+    plain = fa.gps_heading_anchors(latlons, edges, shapes, robust=False)[0]
+
+    h = np.array([o[1] for o in fa.gps_heading_observations(latlons, edges, shapes)[0]])
+    w = np.array(weights)
+    expected = float(np.arctan2(np.sum(w * np.sin(h)), np.sum(w * np.cos(h))))
+    assert plain == pytest.approx(expected, abs=1e-12)
+    assert np.ptp(np.degrees(h)) > 1.0  # the observations really differ, so the weights matter
 
 
 def test_gps_heading_anchors_equal_camera_yaws_on_exact_data() -> None:
@@ -372,10 +413,11 @@ def test_gps_heading_anchors_equal_camera_yaws_on_exact_data() -> None:
 def test_robust_combination_resists_a_short_edge_with_gps_error() -> None:
     # The 0351 pathology: node 0 has three correct along-track edges (13.4 / 26.8 / 40.2 m)
     # and one 6 m edge, exactly along the image's vertical axis, whose neighbour's GPS is
-    # off by 1.6 m across track (a ~15 deg direction error). Hand estimate: plain weighted
-    # mean pulled ~1.0 deg off, Huber-reweighted ~0.2 deg. Capability claim: robust error
-    # <= 0.35 x non-robust error; the non-robust value equals the closed-form weighted
-    # circular mean of the observations (weights from the separately tested sigma).
+    # off by 1.6 m across track (a ~15 deg direction error). With one constant sigma the four
+    # observations weigh the same, so hand estimate: plain mean pulled ~15/4 ~ 3.7 deg off
+    # (the old direction/distance sigma had damped the short edge to ~1.0 deg); Huber
+    # (c = 1.345 sigma ~ 2.3 deg) cuts the outlier's weight to ~0.15 of the others, ~0.7 deg.
+    # Capability claim: robust error <= 0.35 x non-robust error.
     yaw = 83.0  # course == yaw, so along-track edges sit at alpha = -90 deg exactly
     along = lambda d: SyntheticCamera(d * np.sin(np.radians(yaw)), d * np.cos(np.radians(yaw)), 100.0, yaw)
     cameras = {0: along(0.0), 1: along(13.4), 2: along(26.8), 3: along(40.2), 4: along(-6.0)}

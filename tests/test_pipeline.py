@@ -29,6 +29,8 @@ import pytest
 import sea_mosaic.pipeline as pipeline_module
 from sea_mosaic.config import PipelineConfig
 from sea_mosaic.global_poses import GlobalPoseEstimate
+from sea_mosaic.edge_consistency import EdgeCheck
+from sea_mosaic.estimate import sequential_pairs
 from sea_mosaic.gps_lag import GpsLagEstimate
 from sea_mosaic.matcher import MatchResult
 from sea_mosaic.pipeline import run_pipeline
@@ -59,8 +61,31 @@ def _line_cameras(n: int, step_m: float = 13.4) -> dict[int, SyntheticCamera]:
     }
 
 
+def _survey_cameras(n_per_line: int, step_m: float = 13.4) -> dict[int, SyntheticCamera]:
+    """Two opposite flight lines 27 m apart, like real lines B and C: line B eastbound
+    (indices 0..n-1, yaw 70.8 deg), line C westbound right above it (n..2n-1, index n above
+    node n-1, yaw -109.2 deg). Every node has >= 3 candidate edges (< 40 m): along-line 13.4 /
+    26.8 m, across 27 m, diagonals 30.1 / 38.0 m -- the minimum the edge-consistency check
+    can verify (CONSENSUS_MIN_AGREE). A single line leaves its end nodes with 2 edges."""
+    course = np.radians(83.0)
+    line_b = [(k * step_m * np.sin(course), k * step_m * np.cos(course)) for k in range(n_per_line)]
+    up = (-27.0 * np.cos(course), 27.0 * np.sin(course))  # perpendicular to the course, northward
+    cams = {k: SyntheticCamera(e, n, ALTITUDE, 70.8) for k, (e, n) in enumerate(line_b)}
+    for m, (e, n) in enumerate(reversed(line_b)):
+        cams[n_per_line + m] = SyntheticCamera(e + up[0], n + up[1], ALTITUDE, -109.2)
+    return cams
+
+
 def _scene(n: int):
-    return pipeline_scene(_line_cameras(n))
+    """n = 1: one image. Otherwise n must be even: two opposite lines of n / 2 images."""
+    if n == 1:
+        return pipeline_scene(_line_cameras(1))
+    assert n % 2 == 0 and n >= 4, "multi-image scenes need >= 3 candidate edges per node"
+    return pipeline_scene(_survey_cameras(n // 2))
+
+
+def _all_edges_of(scene, *nodes) -> set[tuple[int, int]]:
+    return {p for p in scene.pairs if set(p) & set(nodes)}
 
 
 def _config(scene, **overrides) -> PipelineConfig:
@@ -70,15 +95,13 @@ def _config(scene, **overrides) -> PipelineConfig:
 
 
 def _isolated_node_scene():
-    """5 images on a line; node 2 is sandwiched between two edges that both fail (2
-    correspondences -> cv2.findHomography raises inside match_pair), so it has no usable
-    edge. A (1, 3) bypass keeps {3, 4} connected to {0, 1}, so node 2 is the only image
-    without image evidence (without the bypass {3, 4} would be a separate component --
-    fine for the new architecture, but it would test something else)."""
-    scene = _scene(5)
-    matcher = SceneMatcher(scene, fail_pairs={(1, 2), (2, 3)})
-    pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (1, 3)]
-    return scene, matcher, pairs
+    """Two lines of 4; every edge of node 2 fails (2 correspondences -> cv2.findHomography
+    raises inside match_pair), so node 2 has no usable edge while every other node keeps >= 3
+    edges. (The old version, 5 images on one line with node 2 between two failing edges,
+    left line-end nodes with 2 edges -- unverifiable for the edge-consistency check.)"""
+    scene = _scene(8)
+    matcher = SceneMatcher(scene, fail_pairs=_all_edges_of(scene, 2))
+    return scene, matcher, list(scene.pairs)
 
 
 def _estimate_returning(global_transforms: GlobalTransforms, **overrides) -> GlobalPoseEstimate:
@@ -100,6 +123,7 @@ def _estimate_returning(global_transforms: GlobalTransforms, **overrides) -> Glo
             lag_m=2.3, status="estimated", reason=None, rounds=2, history_m=[0.0, 2.3, 2.3],
             trusted_nodes=3, uncorrected_nodes=set(),
         ),
+        edge_check=EdgeCheck(accepted=[], rejected={}, consensus={}, ppm_mode=float("nan"), ppm_support=0),
     )
     fields.update(overrides)
     return GlobalPoseEstimate(**fields)
@@ -227,7 +251,7 @@ def test_run_pipeline_image_without_edge_or_gps_fails_but_others_succeed(caplog)
         _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, latlons=latlons, pairs=pairs))
 
     assert metrics_df["pipeline_status"][0] == "partial_success"
-    assert metrics_df["successful_image_count"][0] == 4
+    assert metrics_df["successful_image_count"][0] == 7
     assert metrics_df["failed_image_indices"][0] == [2]
     assert "{2: 'no_determined_edge'}" in caplog.text
 
@@ -245,26 +269,26 @@ def test_run_pipeline_image_with_gps_but_no_edge_still_fails(source: str) -> Non
     )
 
     assert metrics_df["pipeline_status"][0] == "partial_success"
-    assert metrics_df["successful_image_count"][0] == 4
+    assert metrics_df["successful_image_count"][0] == 7
     assert metrics_df["failed_image_indices"][0] == [2]
 
 
 def test_run_pipeline_mixed_failures_report_exactly_the_failed_images_and_reasons(caplog) -> None:
-    """Three different ways to fail in one run: node 2 sandwiched between two failed edges,
-    node 5 a dead end whose only edge fails (both "no_determined_edge"), node 4 with a good
-    edge but no GPS ("unlocated")."""
-    scene = pipeline_scene(_line_cameras(6))
-    matcher = SceneMatcher(scene, fail_pairs={(1, 2), (2, 3), (4, 5)})
-    pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (1, 3)]
-    latlons = {k: v for k, v in scene.latlons.items() if k != 4}
+    """Three failures in one run: nodes 2 and 4 have every edge failing
+    ("no_determined_edge"), node 8 has good edges but no GPS ("unlocated" -- its edges are
+    rejected as no_gps by the edge-consistency check). Two lines of 6, failures kept off the
+    corners so every other node still has >= 3 consistent edges."""
+    scene = _scene(12)
+    matcher = SceneMatcher(scene, fail_pairs=_all_edges_of(scene, 2, 4))
+    latlons = {k: v for k, v in scene.latlons.items() if k != 8}
 
     with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
-        _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, latlons=latlons, pairs=pairs))
+        _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, latlons=latlons))
 
     assert metrics_df["pipeline_status"][0] == "partial_success"
-    assert metrics_df["successful_image_count"][0] == 3
-    assert metrics_df["failed_image_indices"][0] == [2, 4, 5]
-    assert "{2: 'no_determined_edge', 4: 'unlocated', 5: 'no_determined_edge'}" in caplog.text
+    assert metrics_df["successful_image_count"][0] == 9
+    assert metrics_df["failed_image_indices"][0] == [2, 4, 8]
+    assert "{2: 'no_determined_edge', 4: 'no_determined_edge', 8: 'unlocated'}" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +300,7 @@ def test_run_pipeline_no_usable_edge_is_failed(caplog) -> None:
     """Replaces the old "only the reference image survives" test: that state no longer
     exists. There is no reference image, and a pose needs a Stage C alignment edge whose
     two endpoints both get poses, so a multi-image run poses either 0 or >= 2 images."""
-    scene = _scene(3)
+    scene = _scene(4)
     matcher = SceneMatcher(scene, fail_pairs=set(scene.pairs))
 
     with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
@@ -284,9 +308,10 @@ def test_run_pipeline_no_usable_edge_is_failed(caplog) -> None:
 
     assert metrics_df["pipeline_status"][0] == "failed"
     assert metrics_df["successful_image_count"][0] == 0
-    assert metrics_df["failed_image_indices"][0] == [0, 1, 2]
+    assert metrics_df["failed_image_indices"][0] == [0, 1, 2, 3]
     assert mosaic.shape == (0, 0, 3)
-    assert "pixels_per_meter_unavailable" in caplog.text
+    # no edge at all reaches Stage B any more: the run fails in the edge-consistency step
+    assert "global pose estimation: no_consistent_edges" in caplog.text
 
 
 def test_run_pipeline_without_gps_is_failed_and_logs_why(caplog) -> None:
@@ -348,17 +373,17 @@ def test_run_pipeline_empty_input_is_failed_without_crashing() -> None:
 
 
 def test_run_pipeline_estimate_stage_pair_exception_is_isolated_not_fatal() -> None:
-    """(1, 2) gets 2 correspondences and makes match_pair raise a REAL cv2.error --
-    run_pipeline must not crash; that edge is excluded, node 2 (no other edge) fails,
-    nodes 0 and 1 succeed."""
-    scene = _scene(3)
-    matcher = SceneMatcher(scene, fail_pairs={(1, 2)})
+    """Every edge of node 5 gets 2 correspondences and makes match_pair raise a REAL
+    cv2.error -- run_pipeline must not crash; those edges are excluded, node 5 (no other
+    edge) fails, the other five succeed."""
+    scene = _scene(6)
+    matcher = SceneMatcher(scene, fail_pairs=_all_edges_of(scene, 5))
 
-    _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, pairs=[(0, 1), (1, 2)]))
+    _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene))
 
     assert metrics_df["pipeline_status"][0] == "partial_success"
-    assert metrics_df["successful_image_count"][0] == 2
-    assert metrics_df["failed_image_indices"][0] == [2]
+    assert metrics_df["successful_image_count"][0] == 5
+    assert metrics_df["failed_image_indices"][0] == [5]
 
 
 def _poisoned_transforms(bad: np.ndarray) -> GlobalTransforms:
@@ -417,8 +442,8 @@ def test_run_pipeline_metrics_df_matches_computed_classification() -> None:
 
     _mosaic, metrics_df = run_pipeline(scene.images, matcher, _config(scene, pairs=pairs))
 
-    assert metrics_df["input_image_count"][0] == 5
-    assert metrics_df["stitch_success_rate"][0] == pytest.approx(metrics_df["successful_image_count"][0] / 5)
+    assert metrics_df["input_image_count"][0] == 8
+    assert metrics_df["stitch_success_rate"][0] == pytest.approx(metrics_df["successful_image_count"][0] / 8)
     assert isinstance(metrics_df, pd.DataFrame)
     assert len(metrics_df) == 1
 
@@ -506,10 +531,42 @@ def test_run_pipeline_logs_nodes_left_uncorrected(caplog) -> None:
     assert "GPS lag not corrected" not in caplog.text
 
 
+def test_p1_run_pipeline_logs_rejected_edges_by_reason(caplog) -> None:
+    """The check's rejections must be visible even though metrics_df has no column for them."""
+    images = {k: _tagged_image(k, size=5) for k in range(3)}
+    matcher = _ScriptedMatcher({(0, 1): _good_match_result(), (1, 2): _good_match_result()})
+    shift = np.array([[1.0, 0.0, 10.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    gt = GlobalTransforms({0: np.eye(3), 1: shift, 2: shift @ shift}, None, "converged", np.nan)
+    check = EdgeCheck(accepted=[], rejected={(0, 5): "length", (1, 6): "heading_disagrees", (2, 7): "length"},
+                      consensus={}, ppm_mode=28.0, ppm_support=10)
+
+    with caplog.at_level(logging.WARNING, logger="sea_mosaic.pipeline"):
+        with patch.object(pipeline_module, "estimate_global_poses", return_value=_estimate_returning(gt, edge_check=check)):
+            run_pipeline(images, matcher, PipelineConfig())
+
+    assert "edge consistency check rejected 3 edges: {'heading_disagrees': 1, 'length': 2}" in caplog.text
+
+
+def test_p2_default_pairs_are_gps_proximity_pairs_when_gps_is_given() -> None:
+    """With lat/lon, config.pairs=None means every pair closer than 40 m (sequential pairs
+    give each node <= 2 edges, which the edge-consistency check can never verify: it needs
+    >= CONSENSUS_MIN_AGREE observations per node). Without GPS the run fails anyway; the
+    matching then stays sequential."""
+    scene = _scene(6)
+    real = pipeline_module.match_pair
+    with patch.object(pipeline_module, "match_pair", wraps=real) as spy:
+        run_pipeline(scene.images, SceneMatcher(scene), PipelineConfig(latlons=dict(scene.latlons)))
+    assert sorted((c.args[3], c.args[4]) for c in spy.call_args_list) == sorted(scene.pairs)
+
+    with patch.object(pipeline_module, "match_pair", wraps=real) as spy:
+        run_pipeline(scene.images, SceneMatcher(scene), PipelineConfig())
+    assert sorted((c.args[3], c.args[4]) for c in spy.call_args_list) == sequential_pairs(scene.images)
+
+
 def test_run_pipeline_gimbal_source_without_gimbal_data_raises() -> None:
     """A configuration error, not a data problem: raised (by estimate_global_poses), not
     reported as a failed run."""
-    scene = _scene(3)
+    scene = _scene(4)
     with pytest.raises(ValueError, match="gimbal_yaw_deg"):
         run_pipeline(scene.images, SceneMatcher(scene), _config(scene, heading_anchor_source="gimbal"))
 

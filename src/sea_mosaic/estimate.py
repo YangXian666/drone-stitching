@@ -10,6 +10,7 @@ import itertools
 import cv2
 import numpy as np
 
+from sea_mosaic.geo.projection import geodetic_to_local_xy
 from sea_mosaic.matcher import Matcher
 from sea_mosaic.types import PairResult
 
@@ -25,6 +26,25 @@ def sequential_pairs(images: dict[int, np.ndarray]) -> list[tuple[int, int]]:
     """
     sorted_keys = sorted(images)
     return list(zip(sorted_keys, sorted_keys[1:]))
+
+
+# run_pipeline's default candidate rule when GPS is available: every pair closer than this.
+# 40 m is the rule all real-data validation used (184 pairs on data/, 700-edge census).
+GPS_PAIR_MAX_DISTANCE_M = 40.0
+
+
+def gps_proximity_pairs(
+    latlons: dict[int, tuple[float, float] | None], max_distance_m: float = GPS_PAIR_MAX_DISTANCE_M
+) -> list[tuple[int, int]]:
+    """(i, j), i < j, sorted, for every two nodes with finite lat/lon closer than
+    max_distance_m (geo.projection's local equirectangular distance)."""
+    located = sorted(k for k, v in latlons.items() if v is not None and bool(np.all(np.isfinite(v))))
+    return [
+        (i, j)
+        for n, i in enumerate(located)
+        for j in located[n + 1:]
+        if float(np.hypot(*geodetic_to_local_xy(*latlons[j], *latlons[i]))) < max_distance_m
+    ]
 
 
 def match_pair(

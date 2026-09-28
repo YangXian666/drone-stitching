@@ -30,7 +30,8 @@ class PipelineConfig:
         gps_lag.load_exif_capture_times (EXIF DateTimeOriginal only). Used to correct the
         GPS recording lag at the GPS input for every stage; without it no correction is
         applied and the run logs that it was not.
-    pairs: image pairs to match; None means consecutive-neighbour pairs.
+    pairs: image pairs to match; None means every pair closer than 40 m of GPS
+        (estimate.gps_proximity_pairs) when latlons is given, else consecutive-neighbour pairs.
     loops: image-index loops for metrics.compute_cycle_loop_error.
     """
 

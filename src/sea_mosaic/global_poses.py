@@ -13,6 +13,13 @@ weight or parameter may change here without re-validating.
    Without capture times, or when the lag is not estimable, lat/lon pass through
    unchanged and gps_lag says why. (Travel directions may use the GPS of images without
    edges -- that orders fixes, it gives no node a pose.)
+1c. Edge-consistency check (edge_consistency): every filtered edge is checked against the
+   (corrected) GPS -- heading consensus, length, orientation, rotation -- and only the
+   accepted edges exist from here on: evidenced nodes, pixels_per_meter, the Stage A
+   weights' inlier median, the heading anchors, Stage C and Stage D all use them. A node
+   whose filtered edges were all rejected gets "no_consistent_edge"; no accepted edge at
+   all fails the run with "no_consistent_edges". The lag estimate (1b) runs on the filtered
+   edges before this check -- it has its own consensus.
 2. pixels_per_meter estimated from the data (gps_placement.estimate_pixels_per_meter).
 3. Stage B: place_by_gps, origin = smallest evidenced node with GPS.
 4. Stage A: average_rotations, edge weight inlier_count / median(inlier_count of used edges),
@@ -35,6 +42,7 @@ from typing import Literal
 
 import numpy as np
 
+from sea_mosaic.edge_consistency import EdgeCheck, check_edge_consistency
 from sea_mosaic.frame_alignment import (
     GPS_HEADING_ANCHOR_WEIGHT,
     HeadingEdge,
@@ -73,11 +81,12 @@ HEADING_ANCHOR_SOURCES = ("gps", "gimbal", "none")
 class GlobalPoseEstimate:
     """GlobalTransforms for downstream warp/blend/metrics, plus Stage A-D diagnostics.
 
-    failure_reason is None on success, otherwise one of "no_gps",
+    failure_reason is None on success, otherwise one of "no_gps", "no_consistent_edges",
     "pixels_per_meter_unavailable", "no_posed_nodes", "refinement_not_converged" (in the
     last case the not-converged poses are still returned, as refine_poses does).
     node_failure_reasons maps every node without a pose to "no_determined_edge",
-    "unlocated", "unoriented", "unaligned_component", or the run's failure_reason when the
+    "no_consistent_edge", "unlocated", "unoriented", "unaligned_component", or the run's
+    failure_reason when the
     whole run failed before any node could be posed.
     """
 
@@ -93,6 +102,7 @@ class GlobalPoseEstimate:
     term_rms: dict[str, float]
     irls_rounds: int
     gps_lag: GpsLagEstimate
+    edge_check: EdgeCheck
 
 
 def _validate(heading_anchor_source: str, gimbal_yaw_deg: dict[int, float] | None) -> None:
@@ -114,6 +124,7 @@ def _failed(
     node_failure_reasons: dict[int, str],
     heading_anchor_source: str,
     gps_lag: GpsLagEstimate,
+    edge_check: EdgeCheck,
     pixels_per_meter: float = float(np.nan),
 ) -> GlobalPoseEstimate:
     return GlobalPoseEstimate(
@@ -131,6 +142,7 @@ def _failed(
         term_rms={},
         irls_rounds=0,
         gps_lag=gps_lag,
+        edge_check=edge_check,
     )
 
 
@@ -166,10 +178,24 @@ def estimate_global_poses(
     ]
 
     gps_lag = estimate_gps_lag(heading_edges, latlons, capture_times_s, image_shapes)
-    if not latlons:
-        return _failed("no_gps", reasons | {k: "unlocated" for k in evidenced}, heading_anchor_source, gps_lag)
     if gps_lag.status == "estimated":
         latlons = shift_latlons(latlons, travel_directions(latlons, capture_times_s), gps_lag.lag_m)
+    edge_check = check_edge_consistency(usable, latlons, image_shapes)
+    if not latlons:
+        return _failed("no_gps", reasons | {k: "unlocated" for k in evidenced}, heading_anchor_source, gps_lag, edge_check)
+
+    # From here on only the edges that passed the consistency check exist.
+    usable = edge_check.accepted
+    consistent = {p.src_index for p in usable} | {p.dst_index for p in usable}
+    # A node with no accepted edge: "unlocated" when it has no GPS itself (the more basic
+    # reason -- its edges were rejected as no_gps), else "no_consistent_edge".
+    reasons |= {k: ("unlocated" if k not in latlons else "no_consistent_edge") for k in evidenced - consistent}
+    evidenced = consistent
+    if not usable:
+        return _failed("no_consistent_edges", reasons, heading_anchor_source, gps_lag, edge_check)
+    heading_edges = [
+        HeadingEdge(p.src_index, p.dst_index, p.homography, image_shapes[p.src_index], 1.0) for p in usable
+    ]
     located = {k: v for k, v in latlons.items() if k in evidenced}
 
     try:
@@ -186,6 +212,7 @@ def estimate_global_poses(
             reasons | {k: "pixels_per_meter_unavailable" for k in evidenced},
             heading_anchor_source,
             gps_lag,
+            edge_check,
         )
 
     placement = place_by_gps(located, pixels_per_meter, node_indices=evidenced)
@@ -234,7 +261,7 @@ def estimate_global_poses(
             reasons[k] = "unoriented"
 
     if not stage_d.poses:
-        return _failed("no_posed_nodes", reasons, heading_anchor_source, gps_lag, pixels_per_meter)
+        return _failed("no_posed_nodes", reasons, heading_anchor_source, gps_lag, edge_check, pixels_per_meter)
 
     return GlobalPoseEstimate(
         global_transforms=GlobalTransforms(
@@ -254,4 +281,5 @@ def estimate_global_poses(
         term_rms=dict(stage_d.term_rms),
         irls_rounds=stage_d.irls_rounds,
         gps_lag=gps_lag,
+        edge_check=edge_check,
     )

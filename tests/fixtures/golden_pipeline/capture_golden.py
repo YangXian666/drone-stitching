@@ -44,6 +44,14 @@ HISTORY
   NOT recaptured: it mocks pose estimation out and its old golden still matches bit for
   bit, which shows that everything after pose estimation (warp, blend, classification,
   metrics) is unchanged -- not that the old and new pose estimation agree.
+- Edge-consistency check + constant heading sigma (2026-09-27): baseline deliberately reset
+  again. The check needs >= CONSENSUS_MIN_AGREE (3) candidate edges per node, so the
+  single-line scenes (line-end nodes with 2 edges) were replaced by two opposite lines 27 m
+  apart (test_pipeline._survey_cameras): all_images_well_matched is 2 x 3 images,
+  isolated_node_without_edge 2 x 4 with every edge of node 2 failing. Determinism check: 5
+  fresh-process recaptures, identical sha256 (all_images_well_matched e494ca68...,
+  isolated_node_without_edge 86889d18...). nonfinite_transform_isolated again NOT
+  recaptured (it mocks pose estimation out); its .npy is byte-identical.
 """
 
 from __future__ import annotations

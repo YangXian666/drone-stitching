@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 
 from sea_mosaic.estimate import (
+    GPS_PAIR_MAX_DISTANCE_M,
+    gps_proximity_pairs,
     default_inlier_count_reference,
     estimate_all_pairs,
     match_pair,
@@ -214,3 +216,22 @@ def test_default_inlier_count_reference_matches_real_nine_edge_measurement() -> 
 
 def test_default_inlier_count_reference_empty_pair_results_is_nan() -> None:
     assert np.isnan(default_inlier_count_reference([]))
+
+
+# --- gps_proximity_pairs: run_pipeline's default pairing when GPS is available ---------
+
+
+def test_gps_proximity_pairs_are_all_pairs_closer_than_40_m() -> None:
+    """40 m: the candidate rule every real-data validation used (184 pairs on data/). Pairs
+    are (smaller, larger) index, sorted; nodes without lat/lon take no part."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from synthetic_camera import latlon_from_en
+
+    assert GPS_PAIR_MAX_DISTANCE_M == 40.0
+    en = {7: (0.0, 0.0), 3: (39.0, 0.0), 5: (0.0, 40.5), 9: (20.0, 20.0), 4: (1.0, 1.0)}
+    latlons = {k: latlon_from_en(e, n) for k, (e, n) in en.items() if k != 4}
+    latlons[4] = None  # no GPS
+    assert gps_proximity_pairs(latlons) == [(3, 7), (3, 9), (5, 9), (7, 9)]
